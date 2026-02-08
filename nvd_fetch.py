@@ -1,21 +1,19 @@
 import argparse
-import os
 from typing import Any, Dict, List
 
 import requests
 
+from settings import load_nvd_api_key
+
 NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
 
-def fetch_cves(product: str) -> List[Dict[str, Any]]:
+def fetch_cves(product: str, api_key: str) -> List[Dict[str, Any]]:
     params = {
         "keywordSearch": product,
         "resultsPerPage": 200,
     }
-    headers = {}
-    api_key = os.getenv("NVD_API_KEY")
-    if api_key:
-        headers["apiKey"] = api_key
+    headers = {"apiKey": api_key}
 
     response = requests.get(NVD_API_URL, params=params, headers=headers, timeout=30)
     response.raise_for_status()
@@ -59,9 +57,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch CVEs from NVD API 2.0")
     parser.add_argument("--product", required=True, help="Product keyword, e.g., nginx")
     parser.add_argument("--min-cvss", type=float, default=0.0, help="Minimum CVSS score")
+    parser.add_argument("--config", default=".env", help="Path to settings file")
     args = parser.parse_args()
 
-    cves = fetch_cves(args.product)
+    api_key = load_nvd_api_key(args.config)
+    cves = fetch_cves(args.product, api_key)
     filtered = filter_cves(cves, args.min_cvss)
 
     print(f"Total CVEs: {len(cves)}")

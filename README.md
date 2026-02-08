@@ -1,52 +1,55 @@
-# NVD API 2.0 CVE 조회 (Flask + HTML/JS)
+# NVD API 2.0 CVE 수집기
 
-이 저장소는 **NVD API 2.0**를 사용해 최신 CVE 정보를 가져오는 간단한 예제를 제공합니다.  
-사용자가 **제품명**(예: `nginx`)과 **최소 CVSS 점수**를 입력하면, 조건에 맞는 취약점만 필터링해 보여주는 웹사이트를 만들기 위한 기반입니다.
+이 저장소는 NVD API 2.0에서 CVE를 수집해 PostgreSQL에 저장하는 기본 프로젝트입니다.
 
-아래는 **1단계: API 데이터를 콘솔에 출력하는 단계**부터 차근차근 진행하는 가이드입니다.
-
----
-
-## 0) 준비 사항
-
-- Python 3.10+
-- `requests` 라이브러리
+## 1) 준비
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.sample .env
 ```
 
----
+`.env`에 실제 값 입력:
+- `NVD_API_KEY`
+- `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`
+- `INITIAL_LOOKBACK_YEARS` (기본 5)
+- `INCREMENTAL_WINDOW_DAYS` (기본 14)
 
-## 1) 콘솔에서 NVD API 2.0 호출하기
-
-먼저 API로 데이터를 받아서 **콘솔에 출력**하는 스크립트를 실행합니다.
-
-### 실행
+## 2) DB 스키마 생성
 
 ```bash
-python nvd_fetch.py --product nginx --min-cvss 7.0
+psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -f db_schema.sql
 ```
 
-### 기대 결과
+## 3) 실행
 
-- `nginx` 관련 CVE 목록이 출력됩니다.
-- `min-cvss` 이상인 항목만 필터링합니다.
+초기 적재 (최근 N년, 기본 5년):
 
----
+```bash
+python3 ingest_cves.py --mode initial
+```
 
-## 2) 다음 단계 (예고)
+증분 적재 (lastModified 기준, 14일 청크):
 
-1. Flask로 검색 폼 생성
-2. 서버에서 NVD API 호출
-3. 결과를 HTML로 렌더링
-4. 간단한 JS로 UX 개선
+```bash
+python3 ingest_cves.py --mode incremental
+```
 
----
+## 4) 콘솔 조회 예시
+
+```bash
+python3 nvd_fetch.py --product nginx --min-cvss 7.0
+```
+
+## 동작 원칙
+
+- `raw` JSON을 DB(`cve.raw`)에 그대로 저장합니다.
+- 초기 적재는 `published` 기준 최근 `INITIAL_LOOKBACK_YEARS`만 수집합니다.
+- 증분 적재는 `lastModified` 기준으로 조회하며, 14일 청크 단위로 안전하게 수집합니다.
+- `cve.id` 기준 `UPSERT`로 신규/갱신을 반영합니다.
 
 ## 참고
 
-- NVD API 2.0 공식 문서: https://nvd.nist.gov/developers/vulnerabilities
-- API 키가 있으면 `NVD_API_KEY` 환경변수로 설정하면 제한이 완화됩니다.
+- NVD API 2.0: https://nvd.nist.gov/developers/vulnerabilities
