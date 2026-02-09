@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS cve (
   cvss_score        numeric(3,1),
   cvss_version      text,
   severity          text,
+  impact_type       text,
+  classification_version text,
   source_identifier text,
   raw               jsonb NOT NULL,
   created_at        timestamptz NOT NULL DEFAULT now(),
@@ -14,7 +16,11 @@ CREATE TABLE IF NOT EXISTS cve (
 CREATE INDEX IF NOT EXISTS idx_cve_published_at ON cve (published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_cve_last_modified_at ON cve (last_modified_at DESC);
 CREATE INDEX IF NOT EXISTS idx_cve_cvss_score ON cve (cvss_score DESC);
+CREATE INDEX IF NOT EXISTS idx_cve_impact_type ON cve (impact_type);
 CREATE INDEX IF NOT EXISTS idx_cve_raw_gin ON cve USING gin (raw);
+
+ALTER TABLE cve ADD COLUMN IF NOT EXISTS impact_type text;
+ALTER TABLE cve ADD COLUMN IF NOT EXISTS classification_version text;
 
 CREATE TABLE IF NOT EXISTS cve_cpe (
   cve_id      text NOT NULL REFERENCES cve (id) ON DELETE CASCADE,

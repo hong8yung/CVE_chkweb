@@ -9,6 +9,7 @@ import psycopg2
 import requests
 from psycopg2.extras import Json, execute_values
 
+from classification import IMPACT_CLASSIFICATION_VERSION, classify_impact_type
 from settings import Settings, load_settings
 
 NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -79,6 +80,16 @@ def extract_cvss(cve: dict[str, Any]) -> tuple[float | None, str | None, str | N
         severity = cvss_data.get("baseSeverity") or metric.get("baseSeverity")
         return score, version, severity
     return None, None, None
+
+
+def extract_english_description_from_cve(cve: dict[str, Any]) -> str:
+    descriptions = cve.get("descriptions", [])
+    if not isinstance(descriptions, list):
+        return ""
+    for desc in descriptions:
+        if isinstance(desc, dict) and desc.get("lang") == "en":
+            return str(desc.get("value", ""))
+    return ""
 
 
 def split_cpe23(criteria: str) -> list[str]:
@@ -182,16 +193,20 @@ def upsert_cves(conn: psycopg2.extensions.connection, vulnerabilities: list[dict
         cvss_score,
         cvss_version,
         severity,
+        impact_type,
+        classification_version,
         source_identifier,
         raw,
         updated_at
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
     ON CONFLICT (id) DO UPDATE SET
         published_at = EXCLUDED.published_at,
         last_modified_at = EXCLUDED.last_modified_at,
         cvss_score = EXCLUDED.cvss_score,
         cvss_version = EXCLUDED.cvss_version,
         severity = EXCLUDED.severity,
+        impact_type = EXCLUDED.impact_type,
+        classification_version = EXCLUDED.classification_version,
         source_identifier = EXCLUDED.source_identifier,
         raw = EXCLUDED.raw,
         updated_at = now()
@@ -207,6 +222,8 @@ def upsert_cves(conn: psycopg2.extensions.connection, vulnerabilities: list[dict
             score, version, severity = extract_cvss(cve)
             published_at = parse_nvd_ts(cve["published"])
             last_modified_at = parse_nvd_ts(cve["lastModified"])
+            description = extract_english_description_from_cve(cve)
+            impact_type = classify_impact_type(description)
 
             cur.execute(
                 upsert_sql,
@@ -217,6 +234,8 @@ def upsert_cves(conn: psycopg2.extensions.connection, vulnerabilities: list[dict
                     score,
                     version,
                     severity,
+                    impact_type,
+                    IMPACT_CLASSIFICATION_VERSION,
                     cve.get("sourceIdentifier"),
                     Json(item),
                 ),

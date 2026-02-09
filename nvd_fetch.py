@@ -1,6 +1,4 @@
 import argparse
-import re
-from decimal import Decimal
 from typing import Any
 
 import psycopg2
@@ -9,7 +7,12 @@ from settings import Settings, load_settings
 
 
 def fetch_cves_from_db(
-    settings: Settings, product: str | None, vendor: str | None, min_cvss: float, limit: int
+    settings: Settings,
+    product: str | None,
+    vendor: str | None,
+    impact_type: str | None,
+    min_cvss: float,
+    limit: int,
 ) -> list[dict[str, Any]]:
     if not product and not vendor:
         raise ValueError("At least one of --product or --vendor is required")
@@ -31,6 +34,9 @@ def fetch_cves_from_db(
     elif vendor:
         where_clauses.append("f.vendor ILIKE %s")
         params.append(f"%{vendor}%")
+    if impact_type:
+        where_clauses.append("c.impact_type ILIKE %s")
+        params.append(f"%{impact_type}%")
 
     where_sql = " AND ".join(where_clauses)
 
@@ -39,6 +45,7 @@ def fetch_cves_from_db(
       c.id,
       c.cvss_score,
       c.last_modified_at,
+      c.impact_type,
       c.raw,
       COALESCE(
         array_agg(DISTINCT
@@ -74,16 +81,15 @@ def fetch_cves_from_db(
         conn.close()
 
     parsed_rows: list[dict[str, Any]] = []
-    for cve_id, cvss_score, last_modified_at, raw, cpe_entries in rows:
+    for cve_id, cvss_score, last_modified_at, impact, raw, cpe_entries in rows:
         description = extract_english_description(raw)
-        vuln_type = classify_vulnerability_type(description)
         parsed_rows.append(
             {
                 "id": cve_id,
                 "cvss_score": cvss_score,
                 "last_modified_at": last_modified_at,
                 "description": description,
-                "vuln_type": vuln_type,
+                "vuln_type": impact or "Other",
                 "cpe_entries": cpe_entries or [],
             }
         )
@@ -101,39 +107,6 @@ def extract_english_description(raw_item: Any) -> str:
         if isinstance(desc, dict) and desc.get("lang") == "en":
             return str(desc.get("value", ""))
     return ""
-
-
-def classify_vulnerability_type(description: str) -> str:
-    text = description.lower()
-    if re.search(r"\brce\b", text):
-        return "Remote Code Execution"
-
-    rules = [
-        ("remote code execution", "Remote Code Execution"),
-        ("authentication bypass", "Authentication Bypass"),
-        ("auth bypass", "Authentication Bypass"),
-        ("privilege escalation", "Privilege Escalation"),
-        ("sql injection", "SQL Injection"),
-        ("command injection", "Command Injection"),
-        ("code injection", "Code Injection"),
-        ("cross-site scripting", "Cross-Site Scripting"),
-        ("xss", "Cross-Site Scripting"),
-        ("path traversal", "Path Traversal"),
-        ("directory traversal", "Path Traversal"),
-        ("ssrf", "Server-Side Request Forgery"),
-        ("request forgery", "Server-Side Request Forgery"),
-        ("deserialization", "Insecure Deserialization"),
-        ("denial of service", "Denial of Service"),
-        ("dos", "Denial of Service"),
-        ("information disclosure", "Information Disclosure"),
-        ("out-of-bounds", "Memory Corruption"),
-        ("buffer overflow", "Memory Corruption"),
-        ("use-after-free", "Memory Corruption"),
-    ]
-    for keyword, label in rules:
-        if keyword in text:
-            return label
-    return "Other"
 
 
 def print_cves(cves: list[dict[str, Any]], min_cvss: float) -> None:
@@ -158,17 +131,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch CVEs from local PostgreSQL")
     parser.add_argument("--product", default=None, help="Product keyword, e.g., nginx")
     parser.add_argument("--vendor", default=None, help="Vendor keyword, e.g., nginx")
+    parser.add_argument("--impact-type", default=None, help="Impact type filter, e.g., Remote Code Execution")
     parser.add_argument("--min-cvss", type=float, default=0.0, help="Minimum CVSS score")
     parser.add_argument("--limit", type=int, default=50, help="Maximum number of rows to print")
     parser.add_argument("--config", default=".env", help="Path to settings file")
     args = parser.parse_args()
     product = (args.product or "").strip() or None
     vendor = (args.vendor or "").strip() or None
+    impact_type = (args.impact_type or "").strip() or None
     if not product and not vendor:
         parser.error("At least one of --product or --vendor must be provided")
 
     settings = load_settings(args.config)
-    cves = fetch_cves_from_db(settings, product, vendor, args.min_cvss, args.limit)
+    cves = fetch_cves_from_db(settings, product, vendor, impact_type, args.min_cvss, args.limit)
 
     print_cves(cves, args.min_cvss)
 

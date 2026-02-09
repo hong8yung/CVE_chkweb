@@ -26,6 +26,7 @@ def shorten(text: str, limit: int = 130) -> str:
 def index() -> str:
     product = (request.args.get("product") or "").strip()
     vendor = (request.args.get("vendor") or "").strip()
+    impact_type = (request.args.get("impact_type") or "").strip()
 
     min_cvss_raw = (request.args.get("min_cvss") or "0").strip()
     limit_raw = (request.args.get("limit") or "50").strip()
@@ -46,7 +47,7 @@ def index() -> str:
     if product or vendor:
         try:
             settings = load_settings(".env")
-            rows = fetch_cves_from_db(settings, product, vendor or None, min_cvss, limit)
+            rows = fetch_cves_from_db(settings, product, vendor or None, impact_type or None, min_cvss, limit)
         except Exception as exc:  # pragma: no cover
             error_text = str(exc)
 
@@ -149,7 +150,7 @@ def index() -> str:
     form {{
       padding: 16px;
       display: grid;
-      grid-template-columns: repeat(5, minmax(140px, 1fr));
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
       gap: 10px;
       align-items: end;
       background: linear-gradient(180deg, #fffdf8, #fff9ef);
@@ -292,6 +293,10 @@ def index() -> str:
         <div>
           <label for="min_cvss">Min CVSS</label>
           <input id="min_cvss" name="min_cvss" value="{escape(str(min_cvss))}">
+        </div>
+        <div>
+          <label for="impact_type">Impact Type</label>
+          <input id="impact_type" name="impact_type" value="{escape(impact_type)}" placeholder="e.g. Remote Code Execution">
         </div>
         <div>
           <label for="limit">Limit (1-500)</label>

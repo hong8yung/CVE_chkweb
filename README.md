@@ -60,6 +60,7 @@ python3 ingest_cves.py --mode incremental
 python3 nvd_fetch.py --vendor ivanti --min-cvss 7.0
 python3 nvd_fetch.py --product endpoint_manager_mobile --min-cvss 7.0
 python3 nvd_fetch.py --vendor nginx --product nginx --min-cvss 7.0 --limit 20
+python3 nvd_fetch.py --vendor ivanti --impact-type "Remote Code Execution" --min-cvss 7.0
 ```
 
 조건 규칙:
@@ -73,6 +74,7 @@ python3 nvd_fetch.py --vendor nginx --product nginx --min-cvss 7.0 --limit 20
 
 ```bash
 python3 -m utils.backfill_cpe_from_raw --config .env --batch-size 1000
+python3 -m utils.backfill_impact_type --config .env --batch-size 1000
 ```
 
 ## 7) 웹 조회 페이지 실행

@@ -42,7 +42,7 @@ python3 ingest_cves.py --mode incremental
 - Run the console query helper:
 
 ```bash
-python3 nvd_fetch.py --vendor ivanti --product endpoint_manager_mobile --min-cvss 7.0
+python3 nvd_fetch.py --vendor ivanti --product endpoint_manager_mobile --impact-type "Remote Code Execution" --min-cvss 7.0
 ```
 
 Use `--config` if your config file path is not `.env`.
@@ -51,6 +51,7 @@ Use `--config` if your config file path is not `.env`.
 
 ```bash
 python3 -m utils.backfill_cpe_from_raw --config .env --batch-size 1000
+python3 -m utils.backfill_impact_type --config .env --batch-size 1000
 ```
 
 - Run local web UI:
