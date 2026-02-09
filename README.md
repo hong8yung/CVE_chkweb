@@ -17,13 +17,28 @@ cp .env.sample .env
 - `INITIAL_LOOKBACK_YEARS` (기본 5)
 - `INCREMENTAL_WINDOW_DAYS` (기본 14)
 
-## 2) DB 스키마 생성
+## 2) PostgreSQL 컨테이너 실행 (Docker Compose)
+
+프로젝트 루트의 `docker-compose.yml`은 `.env`의 DB 값을 사용합니다.
+
+```bash
+docker compose up -d
+docker ps
+```
+
+필요 시 PostgreSQL 준비 상태 확인:
+
+```bash
+docker compose exec postgres pg_isready -U $DB_USER -d $DB_NAME
+```
+
+## 3) DB 스키마 생성
 
 ```bash
 psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -f db_schema.sql
 ```
 
-## 3) 실행
+## 4) 실행
 
 초기 적재 (최근 N년, 기본 5년):
 
@@ -37,7 +52,7 @@ python3 ingest_cves.py --mode initial
 python3 ingest_cves.py --mode incremental
 ```
 
-## 4) 콘솔 조회 예시
+## 5) 콘솔 조회 예시
 
 ```bash
 python3 nvd_fetch.py --product nginx --min-cvss 7.0
