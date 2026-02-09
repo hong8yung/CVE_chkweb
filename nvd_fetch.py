@@ -7,19 +7,26 @@ import psycopg2
 from settings import Settings, load_settings
 
 
-def fetch_cves_from_db(settings: Settings, product: str, min_cvss: float, limit: int) -> list[tuple[str, Decimal | None, str]]:
+def fetch_cves_from_db(
+    settings: Settings, product: str, vendor: str | None, min_cvss: float, limit: int
+) -> list[tuple[str, Decimal | None, str]]:
     sql = """
-    SELECT id, cvss_score, raw
-    FROM cve
-    WHERE cvss_score >= %s
-      AND (
-        id ILIKE %s
-        OR raw::text ILIKE %s
-      )
-    ORDER BY cvss_score DESC NULLS LAST, published_at DESC
+    SELECT q.id, q.cvss_score, q.raw
+    FROM (
+        SELECT c.id, c.cvss_score, c.raw, c.published_at
+        FROM cve AS c
+        JOIN cve_cpe AS cc ON cc.cve_id = c.id
+        WHERE cc.vulnerable = TRUE
+          AND c.cvss_score >= %s
+          AND cc.product ILIKE %s
+          AND (%s::text IS NULL OR cc.vendor ILIKE %s)
+        GROUP BY c.id, c.cvss_score, c.raw, c.published_at
+    ) AS q
+    ORDER BY q.cvss_score DESC NULLS LAST, q.published_at DESC
     LIMIT %s
     """
     like_keyword = f"%{product}%"
+    vendor_like = None if vendor is None else f"%{vendor}%"
 
     conn = psycopg2.connect(
         host=settings.db_host,
@@ -30,7 +37,7 @@ def fetch_cves_from_db(settings: Settings, product: str, min_cvss: float, limit:
     )
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (min_cvss, like_keyword, like_keyword, limit))
+            cur.execute(sql, (min_cvss, like_keyword, vendor_like, vendor_like, limit))
             rows = cur.fetchall()
     finally:
         conn.close()
@@ -65,13 +72,14 @@ def print_cves(cves: list[tuple[str, Decimal | None, str]], min_cvss: float) -> 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch CVEs from local PostgreSQL")
     parser.add_argument("--product", required=True, help="Product keyword, e.g., nginx")
+    parser.add_argument("--vendor", default=None, help="Vendor keyword, e.g., nginx")
     parser.add_argument("--min-cvss", type=float, default=0.0, help="Minimum CVSS score")
     parser.add_argument("--limit", type=int, default=50, help="Maximum number of rows to print")
     parser.add_argument("--config", default=".env", help="Path to settings file")
     args = parser.parse_args()
 
     settings = load_settings(args.config)
-    cves = fetch_cves_from_db(settings, args.product, args.min_cvss, args.limit)
+    cves = fetch_cves_from_db(settings, args.product, args.vendor, args.min_cvss, args.limit)
 
     print_cves(cves, args.min_cvss)
 

@@ -38,6 +38,8 @@ docker compose exec postgres pg_isready -U $DB_USER -d $DB_NAME
 psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -f db_schema.sql
 ```
 
+`cve_cpe` 정규화 테이블이 추가되었으므로, 스키마 적용 후 `initial` 또는 `incremental` 실행으로 CPE 데이터를 채워야 조회가 정확해집니다.
+
 ## 4) 실행
 
 초기 적재 (최근 N년, 기본 5년):
@@ -56,11 +58,21 @@ python3 ingest_cves.py --mode incremental
 
 ```bash
 python3 nvd_fetch.py --product nginx --min-cvss 7.0
+python3 nvd_fetch.py --vendor nginx --product nginx --min-cvss 7.0 --limit 20
+```
+
+## 6) 유틸리티 (기존 raw로 CPE 백필)
+
+이미 적재된 `cve.raw`를 이용해 `cve_cpe`를 채울 수 있습니다(추가 API 호출 없음).
+
+```bash
+python3 utils/backfill_cpe_from_raw.py --config .env --batch-size 1000
 ```
 
 ## 동작 원칙
 
 - `raw` JSON을 DB(`cve.raw`)에 그대로 저장합니다.
+- 제품/벤더 조회를 위해 CPE 정보를 `cve_cpe` 테이블로 정규화 저장합니다.
 - 초기 적재는 `published` 기준 최근 `INITIAL_LOOKBACK_YEARS`만 수집합니다.
 - 증분 적재는 `lastModified` 기준으로 조회하며, 14일 청크 단위로 안전하게 수집합니다.
 - `cve.id` 기준 `UPSERT`로 신규/갱신을 반영합니다.

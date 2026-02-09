@@ -5,6 +5,7 @@
 - `settings.py` loads required settings from a local `.env` file.
 - `db_schema.sql` defines ingestion tables (`cve`, `ingest_job_log`, `ingest_checkpoint`).
 - `nvd_fetch.py` is a console query helper for keyword and CVSS filtering.
+- `utils/` stores one-off operational scripts (e.g., backfill, maintenance helpers).
 - `requirements.txt` lists Python dependencies.
 - `README.md` documents setup and usage.
 - There is no `tests/` directory yet; add one when introducing tests.

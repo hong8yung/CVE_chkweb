@@ -16,6 +16,22 @@ CREATE INDEX IF NOT EXISTS idx_cve_last_modified_at ON cve (last_modified_at DES
 CREATE INDEX IF NOT EXISTS idx_cve_cvss_score ON cve (cvss_score DESC);
 CREATE INDEX IF NOT EXISTS idx_cve_raw_gin ON cve USING gin (raw);
 
+CREATE TABLE IF NOT EXISTS cve_cpe (
+  cve_id      text NOT NULL REFERENCES cve (id) ON DELETE CASCADE,
+  part        text NOT NULL,
+  vendor      text NOT NULL,
+  product     text NOT NULL,
+  version     text,
+  criteria    text NOT NULL,
+  vulnerable  boolean NOT NULL DEFAULT true,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (cve_id, criteria)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cve_cpe_product ON cve_cpe (product);
+CREATE INDEX IF NOT EXISTS idx_cve_cpe_vendor_product ON cve_cpe (vendor, product);
+CREATE INDEX IF NOT EXISTS idx_cve_cpe_vulnerable ON cve_cpe (vulnerable);
+
 CREATE TABLE IF NOT EXISTS ingest_job_log (
   id              bigserial PRIMARY KEY,
   job_type        text NOT NULL,
