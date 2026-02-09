@@ -57,9 +57,15 @@ python3 ingest_cves.py --mode incremental
 ## 5) 콘솔 조회 예시
 
 ```bash
-python3 nvd_fetch.py --product nginx --min-cvss 7.0
+python3 nvd_fetch.py --vendor ivanti --min-cvss 7.0
+python3 nvd_fetch.py --product endpoint_manager_mobile --min-cvss 7.0
 python3 nvd_fetch.py --vendor nginx --product nginx --min-cvss 7.0 --limit 20
 ```
+
+조건 규칙:
+- `vendor`와 `product`를 모두 입력하면 AND 조건으로 검색
+- 둘 중 하나만 입력하면 해당 단일 조건으로 검색
+- 검색은 `ILIKE` 기반이라 대소문자 구분 없이 동작 (`Ivanti`, `ivanti` 동일)
 
 ## 6) 유틸리티 (기존 raw로 CPE 백필)
 

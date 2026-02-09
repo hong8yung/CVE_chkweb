@@ -8,25 +8,44 @@ from settings import Settings, load_settings
 
 
 def fetch_cves_from_db(
-    settings: Settings, product: str, vendor: str | None, min_cvss: float, limit: int
+    settings: Settings, product: str | None, vendor: str | None, min_cvss: float, limit: int
 ) -> list[tuple[str, Decimal | None, str]]:
-    sql = """
+    if not product and not vendor:
+        raise ValueError("At least one of --product or --vendor is required")
+
+    where_clauses = [
+        "cc.vulnerable = TRUE",
+        "c.cvss_score >= %s",
+    ]
+    params: list[Any] = [min_cvss]
+
+    if product and vendor:
+        where_clauses.append("cc.product ILIKE %s")
+        where_clauses.append("cc.vendor ILIKE %s")
+        params.append(f"%{product}%")
+        params.append(f"%{vendor}%")
+    elif product:
+        where_clauses.append("cc.product ILIKE %s")
+        params.append(f"%{product}%")
+    elif vendor:
+        where_clauses.append("cc.vendor ILIKE %s")
+        params.append(f"%{vendor}%")
+
+    where_sql = " AND ".join(where_clauses)
+
+    sql = f"""
     SELECT q.id, q.cvss_score, q.raw
     FROM (
         SELECT c.id, c.cvss_score, c.raw, c.published_at
         FROM cve AS c
         JOIN cve_cpe AS cc ON cc.cve_id = c.id
-        WHERE cc.vulnerable = TRUE
-          AND c.cvss_score >= %s
-          AND cc.product ILIKE %s
-          AND (%s::text IS NULL OR cc.vendor ILIKE %s)
+        WHERE {where_sql}
         GROUP BY c.id, c.cvss_score, c.raw, c.published_at
     ) AS q
     ORDER BY q.cvss_score DESC NULLS LAST, q.published_at DESC
     LIMIT %s
     """
-    like_keyword = f"%{product}%"
-    vendor_like = None if vendor is None else f"%{vendor}%"
+    params.append(limit)
 
     conn = psycopg2.connect(
         host=settings.db_host,
@@ -37,7 +56,7 @@ def fetch_cves_from_db(
     )
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (min_cvss, like_keyword, vendor_like, vendor_like, limit))
+            cur.execute(sql, params)
             rows = cur.fetchall()
     finally:
         conn.close()
@@ -71,15 +90,19 @@ def print_cves(cves: list[tuple[str, Decimal | None, str]], min_cvss: float) -> 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch CVEs from local PostgreSQL")
-    parser.add_argument("--product", required=True, help="Product keyword, e.g., nginx")
+    parser.add_argument("--product", default=None, help="Product keyword, e.g., nginx")
     parser.add_argument("--vendor", default=None, help="Vendor keyword, e.g., nginx")
     parser.add_argument("--min-cvss", type=float, default=0.0, help="Minimum CVSS score")
     parser.add_argument("--limit", type=int, default=50, help="Maximum number of rows to print")
     parser.add_argument("--config", default=".env", help="Path to settings file")
     args = parser.parse_args()
+    product = (args.product or "").strip() or None
+    vendor = (args.vendor or "").strip() or None
+    if not product and not vendor:
+        parser.error("At least one of --product or --vendor must be provided")
 
     settings = load_settings(args.config)
-    cves = fetch_cves_from_db(settings, args.product, args.vendor, args.min_cvss, args.limit)
+    cves = fetch_cves_from_db(settings, product, vendor, args.min_cvss, args.limit)
 
     print_cves(cves, args.min_cvss)
 

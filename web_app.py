@@ -37,7 +37,7 @@ def index() -> str:
 
     rows: list[tuple[str, Decimal | None, str]] = []
     error_text = ""
-    if product:
+    if product or vendor:
         try:
             settings = load_settings(".env")
             rows = fetch_cves_from_db(settings, product, vendor or None, min_cvss, limit)
@@ -80,8 +80,8 @@ def index() -> str:
       <input id="vendor" name="vendor" value="{escape(vendor)}" placeholder="e.g. nginx">
     </div>
     <div>
-      <label for="product">Product (required)</label>
-      <input id="product" name="product" value="{escape(product)}" placeholder="e.g. nginx" required>
+      <label for="product">Product</label>
+      <input id="product" name="product" value="{escape(product)}" placeholder="e.g. endpoint_manager_mobile">
     </div>
     <div>
       <label for="min_cvss">Min CVSS</label>
