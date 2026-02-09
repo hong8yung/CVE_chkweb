@@ -69,6 +69,15 @@ python3 nvd_fetch.py --vendor nginx --product nginx --min-cvss 7.0 --limit 20
 python3 utils/backfill_cpe_from_raw.py --config .env --batch-size 1000
 ```
 
+## 7) 웹 조회 페이지 실행
+
+```bash
+pip install -r requirements.txt
+python3 web_app.py --host 0.0.0.0 --port 8888
+```
+
+브라우저에서 `http://<server-ip>:8888` 접속 후 `vendor`, `product`, `min_cvss`, `limit`으로 조회할 수 있습니다.
+
 ## 동작 원칙
 
 - `raw` JSON을 DB(`cve.raw`)에 그대로 저장합니다.
