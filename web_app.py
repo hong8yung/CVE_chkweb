@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from decimal import Decimal
 from html import escape
 
 from flask import Flask, request
@@ -12,8 +11,15 @@ from settings import load_settings
 app = Flask(__name__)
 
 
-def to_score_text(score: Decimal | None) -> str:
+def to_score_text(score: object) -> str:
     return "N/A" if score is None else str(score)
+
+
+def shorten(text: str, limit: int = 130) -> str:
+    clean = " ".join(text.split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 1] + "..."
 
 
 @app.get("/")
@@ -35,7 +41,7 @@ def index() -> str:
         limit = 50
     limit = max(1, min(limit, 500))
 
-    rows: list[tuple[str, Decimal | None, str]] = []
+    rows: list[dict[str, object]] = []
     error_text = ""
     if product or vendor:
         try:
@@ -44,12 +50,37 @@ def index() -> str:
         except Exception as exc:  # pragma: no cover
             error_text = str(exc)
 
-    rows_html = "".join(
-        f"<tr><td class='id'>{escape(cve_id)}</td><td class='score'>{escape(to_score_text(score))}</td><td class='desc'>{escape(description)}</td></tr>"
-        for cve_id, score, description in rows
-    )
+    row_chunks: list[str] = []
+    for row in rows:
+        cve_id = escape(str(row.get("id", "UNKNOWN")))
+        score_text = escape(to_score_text(row.get("cvss_score")))
+        vuln_type = escape(str(row.get("vuln_type", "Other")))
+        last_modified = escape(str(row.get("last_modified_at", "N/A")))
+        description = str(row.get("description", ""))
+        summary = escape(shorten(description))
+        full_description = escape(description)
+        cpe_entries = row.get("cpe_entries") or []
+        cpe_badges = "".join(
+            f"<span class='cpe-chip'>{escape(str(cpe_value))}</span>" for cpe_value in cpe_entries[:10]
+        )
+        if not cpe_badges:
+            cpe_badges = "<span class='cpe-chip'>-</span>"
+
+        row_chunks.append(
+            "<tr>"
+            f"<td class='id'>{cve_id}</td>"
+            f"<td class='score'>{score_text}</td>"
+            f"<td class='lastmod'>{last_modified}</td>"
+            f"<td class='vtype'>{vuln_type}</td>"
+            "<td class='desc'>"
+            f"<details><summary>{summary}</summary><div class='detail-body'>{full_description}</div></details>"
+            "</td>"
+            f"<td class='cpe'><div class='cpe-wrap'>{cpe_badges}</div></td>"
+            "</tr>"
+        )
+    rows_html = "".join(row_chunks)
     if not rows_html:
-        rows_html = "<tr><td colspan='3'>No results</td></tr>"
+        rows_html = "<tr><td colspan='6'>No results</td></tr>"
 
     error_html = f"<p class='error'>Error: {escape(error_text)}</p>" if error_text else ""
 
@@ -193,6 +224,28 @@ def index() -> str:
     tbody tr:hover {{ background: #fff8ec; }}
     .id {{ width: 190px; white-space: nowrap; font-weight: 700; color: #123a44; }}
     .score {{ width: 92px; white-space: nowrap; }}
+    .desc details {{ cursor: pointer; }}
+    .desc summary {{ color: #334b53; font-weight: 500; }}
+    .desc summary:hover {{ color: #0f6f65; }}
+    .detail-body {{
+      margin-top: 8px;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #fff;
+      line-height: 1.5;
+    }}
+    .cpe-wrap {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+    .cpe-chip {{
+      display: inline-block;
+      border: 1px solid #cfddd9;
+      background: #f0faf7;
+      color: #1a5852;
+      padding: 3px 7px;
+      border-radius: 999px;
+      font-size: 12px;
+      white-space: nowrap;
+    }}
     @keyframes rise {{
       from {{ opacity: 0; transform: translateY(10px); }}
       to {{ opacity: 1; transform: translateY(0); }}
@@ -213,7 +266,10 @@ def index() -> str:
       }}
       td.id::before {{ content: "CVE ID"; display: block; font-size: 12px; color: var(--muted); }}
       td.score::before {{ content: "CVSS"; display: block; font-size: 12px; color: var(--muted); }}
+      td.lastmod::before {{ content: "Last Modified"; display: block; font-size: 12px; color: var(--muted); }}
+      td.vtype::before {{ content: "Type"; display: block; font-size: 12px; color: var(--muted); }}
       td.desc::before {{ content: "Description"; display: block; font-size: 12px; color: var(--muted); }}
+      td.cpe::before {{ content: "CPE"; display: block; font-size: 12px; color: var(--muted); }}
     }}
   </style>
 </head>
@@ -249,7 +305,7 @@ def index() -> str:
       {error_html}
       <table>
         <thead>
-          <tr><th>CVE ID</th><th>CVSS</th><th>Description</th></tr>
+          <tr><th>CVE ID</th><th>CVSS</th><th>Last Modified</th><th>Type</th><th>Description</th><th>CPE</th></tr>
         </thead>
         <tbody>
           {rows_html}
