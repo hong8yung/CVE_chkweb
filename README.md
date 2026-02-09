@@ -83,6 +83,4 @@ python3 utils/backfill_cpe_from_raw.py --config .env --batch-size 1000
 
 ## 향후 과제
 
-- [ ] `utils/rebuild_cpe_for_recent.py` 추가: 최근 N일 CVE만 `cve_cpe` 재생성
-- [ ] `utils/check_ingest_health.py` 추가: `ingest_job_log`, `ingest_checkpoint` 상태 점검
-- [ ] `utils/reset_checkpoint.py` 추가: 증분 수집 시작 시점(`ingest_checkpoint`) 수동 조정
+- 상세 목록은 `TODO.md`를 참고하세요.
