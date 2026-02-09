@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from html import escape
 
 from flask import Flask, request
@@ -20,6 +21,25 @@ def shorten(text: str, limit: int = 130) -> str:
     if len(clean) <= limit:
         return clean
     return clean[: limit - 1] + "..."
+
+
+def format_last_modified(value: object) -> str:
+    if isinstance(value, datetime):
+        base = value.strftime("%Y-%m-%d %H:%M:%S")
+        offset = value.utcoffset()
+        if offset is None:
+            return f"{base} UTC"
+        total_minutes = int(offset.total_seconds() // 60)
+        sign = "+" if total_minutes >= 0 else "-"
+        abs_minutes = abs(total_minutes)
+        hours = abs_minutes // 60
+        minutes = abs_minutes % 60
+        if hours == 0 and minutes == 0:
+            tz_text = "UTC+00"
+        else:
+            tz_text = f"UTC{sign}{hours:02d}:{minutes:02d}"
+        return f"{base} {tz_text}"
+    return str(value)
 
 
 @app.get("/")
@@ -56,7 +76,7 @@ def index() -> str:
         cve_id = escape(str(row.get("id", "UNKNOWN")))
         score_text = escape(to_score_text(row.get("cvss_score")))
         vuln_type = escape(str(row.get("vuln_type", "Other")))
-        last_modified = escape(str(row.get("last_modified_at", "N/A")))
+        last_modified = escape(format_last_modified(row.get("last_modified_at", "N/A")))
         description = str(row.get("description", ""))
         summary = escape(shorten(description))
         full_description = escape(description)
