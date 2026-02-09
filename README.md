@@ -72,7 +72,7 @@ python3 nvd_fetch.py --vendor nginx --product nginx --min-cvss 7.0 --limit 20
 이미 적재된 `cve.raw`를 이용해 `cve_cpe`를 채울 수 있습니다(추가 API 호출 없음).
 
 ```bash
-python3 utils/backfill_cpe_from_raw.py --config .env --batch-size 1000
+python3 -m utils.backfill_cpe_from_raw --config .env --batch-size 1000
 ```
 
 ## 7) 웹 조회 페이지 실행

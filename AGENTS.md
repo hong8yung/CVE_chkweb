@@ -3,8 +3,9 @@
 ## Project Structure & Module Organization
 - `ingest_cves.py` handles CVE ingestion into PostgreSQL (`initial`, `incremental` modes).
 - `settings.py` loads required settings from a local `.env` file.
-- `db_schema.sql` defines ingestion tables (`cve`, `ingest_job_log`, `ingest_checkpoint`).
-- `nvd_fetch.py` is a console query helper for keyword and CVSS filtering.
+- `db_schema.sql` defines ingestion tables (`cve`, `cve_cpe`, `ingest_job_log`, `ingest_checkpoint`).
+- `nvd_fetch.py` queries PostgreSQL-backed CVE data with `vendor`/`product` + CVSS filters.
+- `web_app.py` serves a lightweight web UI for CVE query results.
 - `utils/` stores one-off operational scripts (e.g., backfill, maintenance helpers).
 - `requirements.txt` lists Python dependencies.
 - `README.md` documents setup and usage.
@@ -41,10 +42,22 @@ python3 ingest_cves.py --mode incremental
 - Run the console query helper:
 
 ```bash
-python3 nvd_fetch.py --product nginx --min-cvss 7.0
+python3 nvd_fetch.py --vendor ivanti --product endpoint_manager_mobile --min-cvss 7.0
 ```
 
 Use `--config` if your config file path is not `.env`.
+
+- Run CPE backfill utility from existing `cve.raw`:
+
+```bash
+python3 -m utils.backfill_cpe_from_raw --config .env --batch-size 1000
+```
+
+- Run local web UI:
+
+```bash
+python3 web_app.py --host 0.0.0.0 --port 8888
+```
 
 ## Coding Style & Naming Conventions
 - Python 3.10+.
