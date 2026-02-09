@@ -49,7 +49,8 @@ def parse_cpe23(criteria: str) -> tuple[str, str, str, str] | None:
 
 
 def extract_cpe_matches(cve: dict[str, Any]) -> list[tuple[str, str, str, str, str, bool]]:
-    parsed: set[tuple[str, str, str, str, str, bool]] = set()
+    # Key by criteria to avoid duplicate PK collisions in one INSERT VALUES batch.
+    parsed_by_criteria: dict[str, tuple[str, str, str, str, str, bool]] = {}
     configurations = cve.get("configurations") or []
     if not isinstance(configurations, list):
         return []
@@ -65,7 +66,19 @@ def extract_cpe_matches(cve: dict[str, Any]) -> list[tuple[str, str, str, str, s
                 if cpe is None:
                     continue
                 vulnerable = bool(match.get("vulnerable", False))
-                parsed.add((*cpe, criteria, vulnerable))
+                existing = parsed_by_criteria.get(criteria)
+                if existing is None:
+                    parsed_by_criteria[criteria] = (*cpe, criteria, vulnerable)
+                else:
+                    part, vendor, product, version, criteria_text, existing_vulnerable = existing
+                    parsed_by_criteria[criteria] = (
+                        part,
+                        vendor,
+                        product,
+                        version,
+                        criteria_text,
+                        existing_vulnerable or vulnerable,
+                    )
 
         children = node.get("children") or []
         if isinstance(children, list):
@@ -83,7 +96,7 @@ def extract_cpe_matches(cve: dict[str, Any]) -> list[tuple[str, str, str, str, s
             if isinstance(node, dict):
                 walk_node(node)
 
-    return list(parsed)
+    return list(parsed_by_criteria.values())
 
 
 def main() -> None:
