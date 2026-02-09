@@ -3,6 +3,22 @@ from __future__ import annotations
 import re
 
 IMPACT_CLASSIFICATION_VERSION = "v1"
+IMPACT_TYPE_OPTIONS = [
+    "Remote Code Execution",
+    "Authentication Bypass",
+    "Privilege Escalation",
+    "SQL Injection",
+    "Command Injection",
+    "Code Injection",
+    "Cross-Site Scripting",
+    "Path Traversal",
+    "Server-Side Request Forgery",
+    "Insecure Deserialization",
+    "Denial of Service",
+    "Information Disclosure",
+    "Memory Corruption",
+    "Other",
+]
 
 
 def classify_impact_type(description: str) -> str:

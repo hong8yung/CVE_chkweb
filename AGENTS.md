@@ -6,6 +6,7 @@
 - `db_schema.sql` defines ingestion tables (`cve`, `cve_cpe`, `ingest_job_log`, `ingest_checkpoint`).
 - `nvd_fetch.py` queries PostgreSQL-backed CVE data with `vendor`/`product` + CVSS filters.
 - `web_app.py` serves a lightweight web UI for CVE query results.
+  - Supports multi-select `Impact Type`, sortable headers (`CVSS` / `Last Modified`), reset/share, and per-row copy actions.
 - `utils/` stores one-off operational scripts (e.g., backfill, maintenance helpers).
 - `requirements.txt` lists Python dependencies.
 - `README.md` documents setup and usage.

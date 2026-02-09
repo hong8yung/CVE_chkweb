@@ -10,9 +10,11 @@ def fetch_cves_from_db(
     settings: Settings,
     product: str | None,
     vendor: str | None,
-    impact_type: str | None,
+    impact_types: list[str] | None,
     min_cvss: float,
     limit: int,
+    sort_by: str = "cvss",
+    sort_order: str = "desc",
 ) -> list[dict[str, Any]]:
     if not product and not vendor:
         raise ValueError("At least one of --product or --vendor is required")
@@ -34,11 +36,17 @@ def fetch_cves_from_db(
     elif vendor:
         where_clauses.append("f.vendor ILIKE %s")
         params.append(f"%{vendor}%")
-    if impact_type:
-        where_clauses.append("c.impact_type ILIKE %s")
-        params.append(f"%{impact_type}%")
+    if impact_types:
+        where_clauses.append("c.impact_type = ANY(%s)")
+        params.append(impact_types)
 
     where_sql = " AND ".join(where_clauses)
+    sort_key = (sort_by or "cvss").lower()
+    sort_dir = "ASC" if (sort_order or "desc").lower() == "asc" else "DESC"
+    order_by_sql = {
+        "cvss": f"c.cvss_score {sort_dir} NULLS LAST, c.published_at DESC",
+        "last_modified": f"c.last_modified_at {sort_dir} NULLS LAST, c.cvss_score DESC NULLS LAST",
+    }.get(sort_key, f"c.cvss_score {sort_dir} NULLS LAST, c.published_at DESC")
 
     sql = f"""
     SELECT
@@ -60,8 +68,8 @@ def fetch_cves_from_db(
     JOIN cve_cpe AS f ON f.cve_id = c.id
     LEFT JOIN cve_cpe AS cc ON cc.cve_id = c.id AND cc.vulnerable = TRUE
     WHERE {where_sql}
-    GROUP BY c.id, c.cvss_score, c.last_modified_at, c.raw, c.published_at
-    ORDER BY c.cvss_score DESC NULLS LAST, c.published_at DESC
+    GROUP BY c.id, c.cvss_score, c.last_modified_at, c.impact_type, c.raw, c.published_at
+    ORDER BY {order_by_sql}
     LIMIT %s
     """
     params.append(limit)
@@ -134,16 +142,28 @@ def main() -> None:
     parser.add_argument("--impact-type", default=None, help="Impact type filter, e.g., Remote Code Execution")
     parser.add_argument("--min-cvss", type=float, default=0.0, help="Minimum CVSS score")
     parser.add_argument("--limit", type=int, default=50, help="Maximum number of rows to print")
+    parser.add_argument("--sort-by", default="cvss", choices=["cvss", "last_modified"], help="Sort field")
+    parser.add_argument("--sort-order", default="desc", choices=["asc", "desc"], help="Sort order")
     parser.add_argument("--config", default=".env", help="Path to settings file")
     args = parser.parse_args()
     product = (args.product or "").strip() or None
     vendor = (args.vendor or "").strip() or None
     impact_type = (args.impact_type or "").strip() or None
+    impact_types = [impact_type] if impact_type else None
     if not product and not vendor:
         parser.error("At least one of --product or --vendor must be provided")
 
     settings = load_settings(args.config)
-    cves = fetch_cves_from_db(settings, product, vendor, impact_type, args.min_cvss, args.limit)
+    cves = fetch_cves_from_db(
+        settings,
+        product,
+        vendor,
+        impact_types,
+        args.min_cvss,
+        args.limit,
+        sort_by=args.sort_by,
+        sort_order=args.sort_order,
+    )
 
     print_cves(cves, args.min_cvss)
 

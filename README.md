@@ -85,6 +85,9 @@ python3 web_app.py --host 0.0.0.0 --port 8888
 ```
 
 브라우저에서 `http://<server-ip>:8888` 접속 후 `vendor`, `product`, `min_cvss`, `limit`으로 조회할 수 있습니다.
+`Impact Type`은 다중 선택(복수 선택)으로 필터링할 수 있습니다.
+정렬은 테이블 헤더 `CVSS`, `Last Modified` 클릭으로 토글됩니다.
+`Reset Filters`, `Share URL`, 행별 `Copy CVE`/`Copy CPE` 버튼을 지원합니다.
 
 ## 동작 원칙
 

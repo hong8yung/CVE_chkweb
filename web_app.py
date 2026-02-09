@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from html import escape
+from urllib.parse import urlencode
 
 from flask import Flask, request
 
+from classification import IMPACT_TYPE_OPTIONS
 from nvd_fetch import fetch_cves_from_db
 from settings import load_settings
 
@@ -46,7 +48,15 @@ def format_last_modified(value: object) -> str:
 def index() -> str:
     product = (request.args.get("product") or "").strip()
     vendor = (request.args.get("vendor") or "").strip()
-    impact_type = (request.args.get("impact_type") or "").strip()
+    selected_impacts = [value.strip() for value in request.args.getlist("impact_type") if value.strip()]
+    sort_key = (request.args.get("sort_key") or "cvss_desc").strip()
+    sort_map = {
+        "cvss_desc": ("cvss", "desc"),
+        "cvss_asc": ("cvss", "asc"),
+        "last_modified_desc": ("last_modified", "desc"),
+        "last_modified_asc": ("last_modified", "asc"),
+    }
+    sort_by, sort_order = sort_map.get(sort_key, ("cvss", "desc"))
 
     min_cvss_raw = (request.args.get("min_cvss") or "0").strip()
     limit_raw = (request.args.get("limit") or "50").strip()
@@ -67,7 +77,16 @@ def index() -> str:
     if product or vendor:
         try:
             settings = load_settings(".env")
-            rows = fetch_cves_from_db(settings, product, vendor or None, impact_type or None, min_cvss, limit)
+            rows = fetch_cves_from_db(
+                settings,
+                product,
+                vendor or None,
+                selected_impacts or None,
+                min_cvss,
+                limit,
+                sort_by=sort_by,
+                sort_order=sort_order,
+            )
         except Exception as exc:  # pragma: no cover
             error_text = str(exc)
 
@@ -86,6 +105,7 @@ def index() -> str:
         )
         if not cpe_badges:
             cpe_badges = "<span class='cpe-chip'>-</span>"
+        cpe_for_copy = escape(", ".join(str(cpe_value) for cpe_value in cpe_entries)) if cpe_entries else "-"
 
         row_chunks.append(
             "<tr>"
@@ -97,11 +117,54 @@ def index() -> str:
             f"<details><summary>{summary}</summary><div class='detail-body'>{full_description}</div></details>"
             "</td>"
             f"<td class='cpe'><div class='cpe-wrap'>{cpe_badges}</div></td>"
+            "<td class='actions'>"
+            f"<button type='button' class='copy-btn' data-copy='{cve_id}'>Copy CVE</button>"
+            f"<button type='button' class='copy-btn alt' data-copy='{cpe_for_copy}'>Copy CPE</button>"
+            "</td>"
             "</tr>"
         )
     rows_html = "".join(row_chunks)
     if not rows_html:
-        rows_html = "<tr><td colspan='6'>No results</td></tr>"
+        rows_html = "<tr><td colspan='7'>No results</td></tr>"
+
+    base_query: dict[str, object] = {
+        "vendor": vendor,
+        "product": product,
+        "min_cvss": str(min_cvss),
+        "limit": str(limit),
+    }
+    if selected_impacts:
+        base_query["impact_type"] = selected_impacts
+
+    def build_sort_href(target: str) -> str:
+        if target == "cvss":
+            next_key = "cvss_asc" if sort_key == "cvss_desc" else "cvss_desc"
+        else:
+            next_key = "last_modified_asc" if sort_key == "last_modified_desc" else "last_modified_desc"
+        query = dict(base_query)
+        query["sort_key"] = next_key
+        return "?" + urlencode(query, doseq=True)
+
+    cvss_sort_href = build_sort_href("cvss")
+    last_modified_sort_href = build_sort_href("last_modified")
+    cvss_sort_marker = "▼" if sort_key == "cvss_desc" else ("▲" if sort_key == "cvss_asc" else "")
+    last_modified_sort_marker = (
+        "▼" if sort_key == "last_modified_desc" else ("▲" if sort_key == "last_modified_asc" else "")
+    )
+
+    impact_options_html = "".join(
+        "<label class='impact-option'>"
+        f"<input type='checkbox' name='impact_type' value='{escape(option)}' {'checked' if option in selected_impacts else ''}>"
+        f"<span>{escape(option)}</span>"
+        "</label>"
+        for option in IMPACT_TYPE_OPTIONS
+    )
+    impact_summary = "All impact types" if not selected_impacts else f"Impact Type ({len(selected_impacts)} selected)"
+    impact_selected_html = (
+        "".join(f"<span class='impact-chip'>{escape(value)}</span>" for value in selected_impacts)
+        if selected_impacts
+        else "<span class='impact-chip muted-chip'>No filter</span>"
+    )
 
     error_html = f"<p class='error'>Error: {escape(error_text)}</p>" if error_text else ""
 
@@ -165,14 +228,20 @@ def index() -> str:
       border-radius: 18px;
       background: var(--panel);
       box-shadow: var(--shadow);
-      overflow: hidden;
+      overflow: visible;
     }}
     form {{
       padding: 16px;
       display: grid;
-      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      grid-template-columns:
+        minmax(150px, 1.25fr)
+        minmax(180px, 1.5fr)
+        minmax(90px, 0.65fr)
+        minmax(220px, 1.9fr)
+        minmax(90px, 0.65fr)
+        minmax(120px, 0.85fr);
       gap: 10px;
-      align-items: end;
+      align-items: start;
       background: linear-gradient(180deg, #fffdf8, #fff9ef);
       border-bottom: 1px solid var(--line);
     }}
@@ -193,9 +262,102 @@ def index() -> str:
       outline: none;
       transition: border-color 140ms ease, box-shadow 140ms ease;
     }}
+    select {{
+      width: 100%;
+      padding: 10px 11px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      color: var(--ink);
+      outline: none;
+    }}
     input:focus {{
       border-color: var(--accent-2);
       box-shadow: 0 0 0 3px rgba(15, 111, 101, 0.15);
+    }}
+    select:focus {{
+      border-color: var(--accent-2);
+      box-shadow: 0 0 0 3px rgba(15, 111, 101, 0.15);
+    }}
+    .impact-details {{
+      position: relative;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      overflow: visible;
+    }}
+    .impact-details > summary {{
+      list-style: none;
+      cursor: pointer;
+      padding: 10px 11px;
+      font-size: 14px;
+      user-select: none;
+    }}
+    .impact-details > summary::-webkit-details-marker {{ display: none; }}
+    .impact-details[open] > summary {{
+      border-bottom: 1px solid var(--line);
+      background: #f9fbfa;
+    }}
+    .impact-list {{
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      width: 320px;
+      max-width: min(86vw, 360px);
+      z-index: 60;
+      max-height: 240px;
+      overflow: auto;
+      padding: 8px;
+      display: grid;
+      gap: 4px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      box-shadow: 0 12px 28px rgba(25, 39, 45, 0.18);
+    }}
+    .impact-option {{
+      display: grid;
+      grid-template-columns: 16px minmax(0, 1fr);
+      align-items: center;
+      gap: 9px;
+      font-size: 13px;
+      min-height: 34px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      line-height: 1.2;
+    }}
+    .impact-option input[type="checkbox"] {{
+      width: 14px;
+      height: 14px;
+      margin: 0;
+      accent-color: #0f6f65;
+    }}
+    .impact-option span {{
+      display: inline-block;
+      min-width: 0;
+      font-weight: 500;
+      color: #2f3f45;
+    }}
+    .impact-option:hover {{ background: #f6faf9; }}
+    .impact-selected {{
+      margin-top: 6px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }}
+    .impact-chip {{
+      border: 1px solid #cfddd9;
+      background: #f0faf7;
+      color: #1a5852;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 11px;
+      white-space: nowrap;
+    }}
+    .muted-chip {{
+      border-color: #d6d9d7;
+      background: #f6f7f6;
+      color: #6b7471;
     }}
     button {{
       width: 100%;
@@ -210,6 +372,32 @@ def index() -> str:
     }}
     button:hover {{ filter: brightness(1.04); }}
     button:active {{ transform: translateY(1px); }}
+    .search-btn {{ align-self: end; }}
+    .field-cvss, .field-limit {{ max-width: 110px; }}
+    .actions-bar {{
+      display: flex;
+      gap: 8px;
+      align-items: end;
+      align-self: end;
+    }}
+    .secondary-btn {{
+      width: auto;
+      background: #f1f4f3;
+      color: #1f4048;
+      border: 1px solid #ccd6d3;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 12px;
+      border-radius: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      min-height: 42px;
+      cursor: pointer;
+      white-space: nowrap;
+    }}
+    .secondary-btn:hover {{ background: #e8edeb; }}
     .meta {{
       margin: 0;
       padding: 12px 16px 4px;
@@ -236,6 +424,15 @@ def index() -> str:
       text-transform: uppercase;
       color: var(--muted);
     }}
+    thead th a {{
+      color: inherit;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }}
+    thead th a:hover {{ color: #1e5a53; }}
+    .sort-mark {{ font-size: 11px; opacity: 0.9; }}
     th, td {{
       border-top: 1px solid var(--line);
       padding: 10px 12px;
@@ -245,6 +442,25 @@ def index() -> str:
     tbody tr:hover {{ background: #fff8ec; }}
     .id {{ width: 190px; white-space: nowrap; font-weight: 700; color: #123a44; }}
     .score {{ width: 92px; white-space: nowrap; }}
+    .actions {{ width: 120px; white-space: nowrap; }}
+    .copy-btn {{
+      width: auto;
+      font-size: 11px;
+      padding: 5px 8px;
+      border-radius: 999px;
+      border: 1px solid #bfd1cb;
+      background: #ecf7f4;
+      color: #164f49;
+      margin-right: 6px;
+      margin-top: 3px;
+      cursor: pointer;
+    }}
+    .copy-btn.alt {{
+      background: #eef3f7;
+      border-color: #c5d0d9;
+      color: #2d4658;
+    }}
+    .copy-btn:hover {{ filter: brightness(0.98); }}
     .desc details {{ cursor: pointer; }}
     .desc summary {{ color: #334b53; font-weight: 500; }}
     .desc summary:hover {{ color: #0f6f65; }}
@@ -275,6 +491,8 @@ def index() -> str:
       .wrap {{ width: min(1120px, 96vw); margin-top: 16px; }}
       form {{ grid-template-columns: 1fr 1fr; }}
       .search-btn {{ grid-column: 1 / -1; }}
+      .actions-bar {{ grid-column: 1 / -1; justify-content: flex-start; }}
+      .impact-list {{ width: min(92vw, 360px); }}
       table, thead, tbody, th, td, tr {{ display: block; }}
       thead {{ display: none; }}
       td {{
@@ -291,6 +509,7 @@ def index() -> str:
       td.vtype::before {{ content: "Type"; display: block; font-size: 12px; color: var(--muted); }}
       td.desc::before {{ content: "Description"; display: block; font-size: 12px; color: var(--muted); }}
       td.cpe::before {{ content: "CPE"; display: block; font-size: 12px; color: var(--muted); }}
+      td.actions::before {{ content: "Actions"; display: block; font-size: 12px; color: var(--muted); }}
     }}
   </style>
 </head>
@@ -302,35 +521,54 @@ def index() -> str:
     </section>
     <section class="panel">
       <form method="get">
-        <div>
+        <div class="field-vendor">
           <label for="vendor">Vendor</label>
           <input id="vendor" name="vendor" value="{escape(vendor)}" placeholder="e.g. ivanti">
         </div>
-        <div>
+        <div class="field-product">
           <label for="product">Product</label>
           <input id="product" name="product" value="{escape(product)}" placeholder="e.g. endpoint_manager_mobile">
         </div>
-        <div>
+        <div class="field-cvss">
           <label for="min_cvss">Min CVSS</label>
-          <input id="min_cvss" name="min_cvss" value="{escape(str(min_cvss))}">
+          <input id="min_cvss" name="min_cvss" type="number" min="0" max="10" step="0.1" value="{escape(str(min_cvss))}">
         </div>
-        <div>
+        <div class="field-impact">
           <label for="impact_type">Impact Type</label>
-          <input id="impact_type" name="impact_type" value="{escape(impact_type)}" placeholder="e.g. Remote Code Execution">
+          <details class="impact-details">
+            <summary>{escape(impact_summary)}</summary>
+            <div class="impact-list">
+              {impact_options_html}
+            </div>
+          </details>
+          <div class="impact-selected">{impact_selected_html}</div>
         </div>
-        <div>
+        <div class="field-limit">
           <label for="limit">Limit (1-500)</label>
-          <input id="limit" name="limit" value="{escape(str(limit))}">
+          <input id="limit" name="limit" type="number" min="1" max="500" step="1" value="{escape(str(limit))}">
         </div>
+        <input type="hidden" name="sort_key" value="{escape(sort_key)}">
         <div class="search-btn">
           <button type="submit">Search CVEs</button>
+        </div>
+        <div class="actions-bar">
+          <a class="secondary-btn" href="/">Reset Filters</a>
+          <button id="share-url-btn" type="button" class="secondary-btn">Share URL</button>
         </div>
       </form>
       <p class="meta">Results: {len(rows)}</p>
       {error_html}
       <table>
         <thead>
-          <tr><th>CVE ID</th><th>CVSS</th><th>Last Modified</th><th>Type</th><th>Description</th><th>CPE</th></tr>
+          <tr>
+            <th>CVE ID</th>
+            <th><a href="{escape(cvss_sort_href)}">CVSS <span class="sort-mark">{escape(cvss_sort_marker)}</span></a></th>
+            <th><a href="{escape(last_modified_sort_href)}">Last Modified <span class="sort-mark">{escape(last_modified_sort_marker)}</span></a></th>
+            <th>Type</th>
+            <th>Description</th>
+            <th>CPE</th>
+            <th>Actions</th>
+          </tr>
         </thead>
         <tbody>
           {rows_html}
@@ -339,6 +577,55 @@ def index() -> str:
     </section>
   </main>
 </body>
+<script>
+  (() => {{
+    const form = document.querySelector("form");
+    const impactDetails = document.querySelector(".impact-details");
+    const shareButton = document.querySelector("#share-url-btn");
+    const copyButtons = document.querySelectorAll(".copy-btn");
+
+    if (impactDetails) {{
+      document.addEventListener("click", (event) => {{
+        if (!impactDetails.open) return;
+        if (impactDetails.contains(event.target)) return;
+        impactDetails.open = false;
+      }});
+
+      document.addEventListener("keydown", (event) => {{
+        if (event.key === "Escape" && impactDetails.open) {{
+          impactDetails.open = false;
+        }}
+      }});
+    }}
+
+    if (shareButton) {{
+      shareButton.addEventListener("click", async () => {{
+        const url = window.location.href;
+        try {{
+          await navigator.clipboard.writeText(url);
+          shareButton.textContent = "Copied URL";
+          setTimeout(() => {{ shareButton.textContent = "Share URL"; }}, 1200);
+        }} catch (_) {{
+          window.prompt("Copy URL:", url);
+        }}
+      }});
+    }}
+
+    copyButtons.forEach((btn) => {{
+      btn.addEventListener("click", async () => {{
+        const text = btn.dataset.copy || "";
+        try {{
+          await navigator.clipboard.writeText(text);
+          const before = btn.textContent;
+          btn.textContent = "Copied";
+          setTimeout(() => {{ btn.textContent = before; }}, 900);
+        }} catch (_) {{
+          window.prompt("Copy value:", text);
+        }}
+      }});
+    }});
+  }})();
+</script>
 </html>
 """
 
