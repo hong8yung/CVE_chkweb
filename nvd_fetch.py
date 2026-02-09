@@ -15,30 +15,64 @@ def fetch_cves_from_db(
     limit: int,
     sort_by: str = "cvss",
     sort_order: str = "desc",
+    last_modified_start: Any | None = None,
+    last_modified_end: Any | None = None,
 ) -> list[dict[str, Any]]:
-    if not product and not vendor:
-        raise ValueError("At least one of --product or --vendor is required")
-
     where_clauses = [
-        "f.vulnerable = TRUE",
         "c.cvss_score >= %s",
     ]
     params: list[Any] = [min_cvss]
 
     if product and vendor:
-        where_clauses.append("f.product ILIKE %s")
-        where_clauses.append("f.vendor ILIKE %s")
+        where_clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM cve_cpe AS f
+                WHERE f.cve_id = c.id
+                  AND f.vulnerable = TRUE
+                  AND f.product ILIKE %s
+                  AND f.vendor ILIKE %s
+            )
+            """
+        )
         params.append(f"%{product}%")
         params.append(f"%{vendor}%")
     elif product:
-        where_clauses.append("f.product ILIKE %s")
+        where_clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM cve_cpe AS f
+                WHERE f.cve_id = c.id
+                  AND f.vulnerable = TRUE
+                  AND f.product ILIKE %s
+            )
+            """
+        )
         params.append(f"%{product}%")
     elif vendor:
-        where_clauses.append("f.vendor ILIKE %s")
+        where_clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM cve_cpe AS f
+                WHERE f.cve_id = c.id
+                  AND f.vulnerable = TRUE
+                  AND f.vendor ILIKE %s
+            )
+            """
+        )
         params.append(f"%{vendor}%")
     if impact_types:
         where_clauses.append("c.impact_type = ANY(%s)")
         params.append(impact_types)
+    if last_modified_start is not None:
+        where_clauses.append("c.last_modified_at >= %s")
+        params.append(last_modified_start)
+    if last_modified_end is not None:
+        where_clauses.append("c.last_modified_at <= %s")
+        params.append(last_modified_end)
 
     where_sql = " AND ".join(where_clauses)
     sort_key = (sort_by or "cvss").lower()
@@ -65,7 +99,6 @@ def fetch_cves_from_db(
         ARRAY[]::text[]
       ) AS cpe_entries
     FROM cve AS c
-    JOIN cve_cpe AS f ON f.cve_id = c.id
     LEFT JOIN cve_cpe AS cc ON cc.cve_id = c.id AND cc.vulnerable = TRUE
     WHERE {where_sql}
     GROUP BY c.id, c.cvss_score, c.last_modified_at, c.impact_type, c.raw, c.published_at
@@ -144,14 +177,22 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=50, help="Maximum number of rows to print")
     parser.add_argument("--sort-by", default="cvss", choices=["cvss", "last_modified"], help="Sort field")
     parser.add_argument("--sort-order", default="desc", choices=["asc", "desc"], help="Sort order")
+    parser.add_argument(
+        "--last-modified-start",
+        default=None,
+        help="Lower bound of last_modified_at (ISO datetime, e.g. 2025-01-01T00:00:00)",
+    )
+    parser.add_argument(
+        "--last-modified-end",
+        default=None,
+        help="Upper bound of last_modified_at (ISO datetime, e.g. 2025-12-31T23:59:59)",
+    )
     parser.add_argument("--config", default=".env", help="Path to settings file")
     args = parser.parse_args()
     product = (args.product or "").strip() or None
     vendor = (args.vendor or "").strip() or None
     impact_type = (args.impact_type or "").strip() or None
     impact_types = [impact_type] if impact_type else None
-    if not product and not vendor:
-        parser.error("At least one of --product or --vendor must be provided")
 
     settings = load_settings(args.config)
     cves = fetch_cves_from_db(
@@ -163,6 +204,8 @@ def main() -> None:
         args.limit,
         sort_by=args.sort_by,
         sort_order=args.sort_order,
+        last_modified_start=args.last_modified_start,
+        last_modified_end=args.last_modified_end,
     )
 
     print_cves(cves, args.min_cvss)

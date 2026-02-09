@@ -46,17 +46,25 @@ def format_last_modified(value: object) -> str:
 
 @app.get("/")
 def index() -> str:
+    sort_key_param = request.args.get("sort_key")
     product = (request.args.get("product") or "").strip()
     vendor = (request.args.get("vendor") or "").strip()
+    last_modified_start_raw = (request.args.get("last_modified_start") or "").strip()
+    last_modified_end_raw = (request.args.get("last_modified_end") or "").strip()
     selected_impacts = [value.strip() for value in request.args.getlist("impact_type") if value.strip()]
-    sort_key = (request.args.get("sort_key") or "cvss_desc").strip()
+    no_filter_input = (
+        not product
+        and not vendor
+        and not last_modified_start_raw
+        and not last_modified_end_raw
+        and not selected_impacts
+    )
     sort_map = {
         "cvss_desc": ("cvss", "desc"),
         "cvss_asc": ("cvss", "asc"),
         "last_modified_desc": ("last_modified", "desc"),
         "last_modified_asc": ("last_modified", "asc"),
     }
-    sort_by, sort_order = sort_map.get(sort_key, ("cvss", "desc"))
 
     min_cvss_raw = (request.args.get("min_cvss") or "0").strip()
     limit_raw = (request.args.get("limit") or "50").strip()
@@ -71,10 +79,36 @@ def index() -> str:
     except ValueError:
         limit = 50
     limit = max(1, min(limit, 500))
+    no_filter_input = no_filter_input and (min_cvss == 0.0) and (limit == 50)
 
+    if sort_key_param:
+        sort_key = sort_key_param.strip()
+    else:
+        sort_key = "last_modified_desc" if no_filter_input else "cvss_desc"
+    sort_by, sort_order = sort_map.get(sort_key, ("cvss", "desc"))
+
+    last_modified_start: datetime | None = None
+    last_modified_end: datetime | None = None
     rows: list[dict[str, object]] = []
     error_text = ""
-    if product or vendor:
+
+    try:
+        if last_modified_start_raw:
+            last_modified_start = datetime.fromisoformat(last_modified_start_raw)
+        if last_modified_end_raw:
+            last_modified_end = datetime.fromisoformat(last_modified_end_raw)
+    except ValueError:
+        error_text = "Invalid Last Modified datetime. Use format YYYY-MM-DDTHH:MM."
+
+    if (
+        not error_text
+        and last_modified_start is not None
+        and last_modified_end is not None
+        and last_modified_start > last_modified_end
+    ):
+        error_text = "Last Modified Start must be earlier than or equal to End."
+
+    if not error_text:
         try:
             settings = load_settings(".env")
             rows = fetch_cves_from_db(
@@ -86,6 +120,8 @@ def index() -> str:
                 limit,
                 sort_by=sort_by,
                 sort_order=sort_order,
+                last_modified_start=last_modified_start,
+                last_modified_end=last_modified_end,
             )
         except Exception as exc:  # pragma: no cover
             error_text = str(exc)
@@ -133,6 +169,10 @@ def index() -> str:
         "min_cvss": str(min_cvss),
         "limit": str(limit),
     }
+    if last_modified_start_raw:
+        base_query["last_modified_start"] = last_modified_start_raw
+    if last_modified_end_raw:
+        base_query["last_modified_end"] = last_modified_end_raw
     if selected_impacts:
         base_query["impact_type"] = selected_impacts
 
@@ -245,6 +285,10 @@ def index() -> str:
       background: linear-gradient(180deg, #fffdf8, #fff9ef);
       border-bottom: 1px solid var(--line);
     }}
+    .field-lastmod-start {{ grid-column: 1 / 2; }}
+    .field-lastmod-end {{ grid-column: 2 / 3; }}
+    .field-vendor {{ grid-column: 1 / 3; }}
+    .field-product {{ grid-column: 3 / 5; }}
     label {{
       font-size: 12px;
       color: var(--muted);
@@ -379,6 +423,7 @@ def index() -> str:
       gap: 8px;
       align-items: end;
       align-self: end;
+      grid-column: 5 / 7;
     }}
     .secondary-btn {{
       width: auto;
@@ -490,6 +535,15 @@ def index() -> str:
     @media (max-width: 900px) {{
       .wrap {{ width: min(1120px, 96vw); margin-top: 16px; }}
       form {{ grid-template-columns: 1fr 1fr; }}
+      .field-lastmod-start,
+      .field-lastmod-end,
+      .field-vendor,
+      .field-product,
+      .field-cvss,
+      .field-impact,
+      .field-limit {{
+        grid-column: auto;
+      }}
       .search-btn {{ grid-column: 1 / -1; }}
       .actions-bar {{ grid-column: 1 / -1; justify-content: flex-start; }}
       .impact-list {{ width: min(92vw, 360px); }}
@@ -517,17 +571,17 @@ def index() -> str:
   <main class="wrap">
     <section class="hero">
       <h1>CVE Explorer</h1>
-      <p class="sub">Search by vendor and product using normalized CPE mappings.</p>
+      <p class="sub">Search by vendor/product and Last Modified range using normalized CPE mappings.</p>
     </section>
     <section class="panel">
       <form method="get">
-        <div class="field-vendor">
-          <label for="vendor">Vendor</label>
-          <input id="vendor" name="vendor" value="{escape(vendor)}" placeholder="e.g. ivanti">
+        <div class="field-lastmod-start">
+          <label for="last_modified_start">Last Modified Start</label>
+          <input id="last_modified_start" name="last_modified_start" type="datetime-local" value="{escape(last_modified_start_raw)}">
         </div>
-        <div class="field-product">
-          <label for="product">Product</label>
-          <input id="product" name="product" value="{escape(product)}" placeholder="e.g. endpoint_manager_mobile">
+        <div class="field-lastmod-end">
+          <label for="last_modified_end">Last Modified End</label>
+          <input id="last_modified_end" name="last_modified_end" type="datetime-local" value="{escape(last_modified_end_raw)}">
         </div>
         <div class="field-cvss">
           <label for="min_cvss">Min CVSS</label>
@@ -547,10 +601,18 @@ def index() -> str:
           <label for="limit">Limit (1-500)</label>
           <input id="limit" name="limit" type="number" min="1" max="500" step="1" value="{escape(str(limit))}">
         </div>
-        <input type="hidden" name="sort_key" value="{escape(sort_key)}">
         <div class="search-btn">
           <button type="submit">Search CVEs</button>
         </div>
+        <div class="field-vendor">
+          <label for="vendor">Vendor</label>
+          <input id="vendor" name="vendor" value="{escape(vendor)}" placeholder="e.g. ivanti">
+        </div>
+        <div class="field-product">
+          <label for="product">Product</label>
+          <input id="product" name="product" value="{escape(product)}" placeholder="e.g. endpoint_manager_mobile">
+        </div>
+        <input type="hidden" name="sort_key" value="{escape(sort_key)}">
         <div class="actions-bar">
           <a class="secondary-btn" href="/">Reset Filters</a>
           <button id="share-url-btn" type="button" class="secondary-btn">Share URL</button>
