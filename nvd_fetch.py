@@ -1,72 +1,79 @@
 import argparse
-from typing import Any, Dict, List
+from decimal import Decimal
+from typing import Any
 
-import requests
+import psycopg2
 
-from settings import load_nvd_api_key
-
-NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-
-
-def fetch_cves(product: str, api_key: str) -> List[Dict[str, Any]]:
-    params = {
-        "keywordSearch": product,
-        "resultsPerPage": 200,
-    }
-    headers = {"apiKey": api_key}
-
-    response = requests.get(NVD_API_URL, params=params, headers=headers, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-    return data.get("vulnerabilities", [])
+from settings import Settings, load_settings
 
 
-def extract_cvss_score(cve: Dict[str, Any]) -> float:
-    metrics = cve.get("cve", {}).get("metrics", {})
-    for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
-        if key in metrics:
-            metric = metrics[key][0]
-            return metric.get("cvssData", {}).get("baseScore", 0.0)
-    return 0.0
+def fetch_cves_from_db(settings: Settings, product: str, min_cvss: float, limit: int) -> list[tuple[str, Decimal | None, str]]:
+    sql = """
+    SELECT id, cvss_score, raw
+    FROM cve
+    WHERE cvss_score >= %s
+      AND (
+        id ILIKE %s
+        OR raw::text ILIKE %s
+      )
+    ORDER BY cvss_score DESC NULLS LAST, published_at DESC
+    LIMIT %s
+    """
+    like_keyword = f"%{product}%"
+
+    conn = psycopg2.connect(
+        host=settings.db_host,
+        port=settings.db_port,
+        dbname=settings.db_name,
+        user=settings.db_user,
+        password=settings.db_password,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (min_cvss, like_keyword, like_keyword, limit))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    parsed_rows: list[tuple[str, Decimal | None, str]] = []
+    for cve_id, cvss_score, raw in rows:
+        description = extract_english_description(raw)
+        parsed_rows.append((cve_id, cvss_score, description))
+    return parsed_rows
 
 
-def filter_cves(cves: List[Dict[str, Any]], min_cvss: float) -> List[Dict[str, Any]]:
-    filtered = []
-    for item in cves:
-        score = extract_cvss_score(item)
-        if score >= min_cvss:
-            filtered.append(item)
-    return filtered
+def extract_english_description(raw_item: Any) -> str:
+    if not isinstance(raw_item, dict):
+        return ""
+    cve = raw_item.get("cve", {})
+    descriptions = cve.get("descriptions", [])
+    if not isinstance(descriptions, list):
+        return ""
+    for desc in descriptions:
+        if isinstance(desc, dict) and desc.get("lang") == "en":
+            return str(desc.get("value", ""))
+    return ""
 
 
-def print_cves(cves: List[Dict[str, Any]]) -> None:
-    for item in cves:
-        cve = item.get("cve", {})
-        cve_id = cve.get("id", "UNKNOWN")
-        description = ""
-        descriptions = cve.get("descriptions", [])
-        for desc in descriptions:
-            if desc.get("lang") == "en":
-                description = desc.get("value", "")
-                break
-        score = extract_cvss_score(item)
-        print(f"{cve_id} | CVSS {score} | {description[:120]}")
+def print_cves(cves: list[tuple[str, Decimal | None, str]], min_cvss: float) -> None:
+    print(f"Filtered CVEs (min CVSS {min_cvss}): {len(cves)}")
+    for cve_id, score, description in cves:
+        score_text = "N/A" if score is None else str(score)
+        print(f"{cve_id} | CVSS {score_text} | {description[:120]}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch CVEs from NVD API 2.0")
+    parser = argparse.ArgumentParser(description="Fetch CVEs from local PostgreSQL")
     parser.add_argument("--product", required=True, help="Product keyword, e.g., nginx")
     parser.add_argument("--min-cvss", type=float, default=0.0, help="Minimum CVSS score")
+    parser.add_argument("--limit", type=int, default=50, help="Maximum number of rows to print")
     parser.add_argument("--config", default=".env", help="Path to settings file")
     args = parser.parse_args()
 
-    api_key = load_nvd_api_key(args.config)
-    cves = fetch_cves(args.product, api_key)
-    filtered = filter_cves(cves, args.min_cvss)
+    settings = load_settings(args.config)
+    cves = fetch_cves_from_db(settings, args.product, args.min_cvss, args.limit)
 
-    print(f"Total CVEs: {len(cves)}")
-    print(f"Filtered CVEs (min CVSS {args.min_cvss}): {len(filtered)}")
-    print_cves(filtered)
+    print_cves(cves, args.min_cvss)
 
 
 if __name__ == "__main__":
