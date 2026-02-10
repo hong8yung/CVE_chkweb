@@ -66,6 +66,7 @@ def index() -> str:
     sort_key_param = request.args.get("sort_key")
     product = (request.args.get("product") or "").strip()
     vendor = (request.args.get("vendor") or "").strip()
+    keyword = (request.args.get("keyword") or "").strip()
     last_modified_start_raw = (request.args.get("last_modified_start") or "").strip()
     last_modified_end_raw = (request.args.get("last_modified_end") or "").strip()
     cpe_missing_only = request.args.get("cpe_missing_only") == "1"
@@ -73,6 +74,7 @@ def index() -> str:
     no_filter_input = (
         not product
         and not vendor
+        and not keyword
         and not last_modified_start_raw
         and not last_modified_end_raw
         and not cpe_missing_only
@@ -134,6 +136,7 @@ def index() -> str:
                 settings,
                 product,
                 vendor or None,
+                keyword or None,
                 selected_impacts or None,
                 min_cvss,
                 limit,
@@ -187,6 +190,7 @@ def index() -> str:
     base_query: dict[str, object] = {
         "vendor": vendor,
         "product": product,
+        "keyword": keyword,
         "min_cvss": str(min_cvss),
         "limit": str(limit),
     }
@@ -311,8 +315,9 @@ def index() -> str:
     }}
     .field-lastmod-start {{ grid-column: 1 / 2; }}
     .field-lastmod-end {{ grid-column: 2 / 3; }}
-    .field-vendor {{ grid-column: 1 / 3; }}
-    .field-product {{ grid-column: 3 / 5; }}
+    .field-keyword {{ grid-column: 1 / 3; }}
+    .field-vendor {{ grid-column: 3 / 5; }}
+    .field-product {{ grid-column: 5 / 7; }}
     label {{
       font-size: 12px;
       color: var(--muted);
@@ -467,7 +472,7 @@ def index() -> str:
       gap: 8px;
       align-items: end;
       align-self: end;
-      grid-column: 5 / 7;
+      grid-column: 1 / 7;
     }}
     .secondary-btn {{
       width: auto;
@@ -649,6 +654,7 @@ def index() -> str:
       .field-lastmod-end,
       .field-vendor,
       .field-product,
+      .field-keyword,
       .field-cvss,
       .field-impact,
       .field-cpe-missing,
@@ -727,6 +733,10 @@ def index() -> str:
         </div>
         <div class="search-btn">
           <button type="submit">Search CVEs</button>
+        </div>
+        <div class="field-keyword">
+          <label for="keyword">Keyword (description/vendor/product)</label>
+          <input id="keyword" name="keyword" value="{escape(keyword)}" placeholder="e.g. ssl, ivanti, endpoint">
         </div>
         <div class="field-vendor">
           <label for="vendor">Vendor</label>

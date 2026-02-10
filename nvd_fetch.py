@@ -10,6 +10,7 @@ def fetch_cves_from_db(
     settings: Settings,
     product: str | None,
     vendor: str | None,
+    keyword: str | None,
     impact_types: list[str] | None,
     min_cvss: float,
     limit: int,
@@ -65,6 +66,31 @@ def fetch_cves_from_db(
             """
         )
         params.append(f"%{vendor}%")
+    if keyword:
+        where_clauses.append(
+            """
+            (
+                EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(COALESCE(c.raw #> '{cve,descriptions}', '[]'::jsonb)) AS d
+                    WHERE d ->> 'value' ILIKE %s
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM cve_cpe AS k
+                    WHERE k.cve_id = c.id
+                      AND k.vulnerable = TRUE
+                      AND (
+                        k.vendor ILIKE %s
+                        OR k.product ILIKE %s
+                      )
+                )
+            )
+            """
+        )
+        params.append(f"%{keyword}%")
+        params.append(f"%{keyword}%")
+        params.append(f"%{keyword}%")
     if impact_types:
         where_clauses.append("c.impact_type = ANY(%s)")
         params.append(impact_types)
@@ -184,6 +210,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch CVEs from local PostgreSQL")
     parser.add_argument("--product", default=None, help="Product keyword, e.g., nginx")
     parser.add_argument("--vendor", default=None, help="Vendor keyword, e.g., nginx")
+    parser.add_argument("--keyword", default=None, help="Search keyword across description/vendor/product")
     parser.add_argument("--impact-type", default=None, help="Impact type filter, e.g., Remote Code Execution")
     parser.add_argument("--min-cvss", type=float, default=0.0, help="Minimum CVSS score")
     parser.add_argument("--limit", type=int, default=50, help="Maximum number of rows to print")
@@ -208,6 +235,7 @@ def main() -> None:
     args = parser.parse_args()
     product = (args.product or "").strip() or None
     vendor = (args.vendor or "").strip() or None
+    keyword = (args.keyword or "").strip() or None
     impact_type = (args.impact_type or "").strip() or None
     impact_types = [impact_type] if impact_type else None
 
@@ -216,6 +244,7 @@ def main() -> None:
         settings,
         product,
         vendor,
+        keyword,
         impact_types,
         args.min_cvss,
         args.limit,
