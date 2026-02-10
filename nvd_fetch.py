@@ -1,10 +1,30 @@
 import argparse
 import math
+from datetime import datetime
 from typing import Any
 
 import psycopg2
 
 from settings import Settings, load_settings
+
+
+def fetch_incremental_checkpoint(settings: Settings) -> datetime | None:
+    conn = psycopg2.connect(
+        host=settings.db_host,
+        port=settings.db_port,
+        dbname=settings.db_name,
+        user=settings.db_user,
+        password=settings.db_password,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value_ts FROM ingest_checkpoint WHERE key = %s", ("daily_last_modified_sync",))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return row[0]
 
 
 def fetch_cves_from_db(

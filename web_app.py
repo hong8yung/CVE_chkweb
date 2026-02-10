@@ -14,7 +14,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from classification import IMPACT_TYPE_OPTIONS
-from nvd_fetch import fetch_cves_from_db
+from nvd_fetch import fetch_cves_from_db, fetch_incremental_checkpoint
 from settings import load_settings
 
 app = Flask(__name__)
@@ -418,6 +418,7 @@ def index() -> str:
     rows: list[dict[str, object]] = []
     total_count = 0
     error_text = ""
+    checkpoint_text = "기록 없음"
     count_cache_key = _build_count_cache_key(
         product,
         vendor,
@@ -450,6 +451,11 @@ def index() -> str:
     if not error_text:
         try:
             settings = load_settings(".env")
+            try:
+                checkpoint_value = fetch_incremental_checkpoint(settings)
+                checkpoint_text = format_last_modified(checkpoint_value) if checkpoint_value else "기록 없음"
+            except Exception:
+                checkpoint_text = "조회 실패"
             rows, total_count = fetch_cves_from_db(
                 settings,
                 product,
@@ -646,7 +652,13 @@ def index() -> str:
       border-radius: 18px;
       background: linear-gradient(135deg, #fffdf8, #fef8ed);
       box-shadow: var(--shadow);
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 14px;
+      flex-wrap: wrap;
     }}
+    .hero-copy {{ min-width: 260px; }}
     h1 {{
       margin: 0;
       font-size: clamp(24px, 3vw, 34px);
@@ -656,6 +668,25 @@ def index() -> str:
       margin: 8px 0 0;
       color: var(--muted);
       font-size: 14px;
+    }}
+    .checkpoint-badge {{
+      margin-left: auto;
+      border: 1px solid #c8d8d3;
+      border-radius: 11px;
+      padding: 8px 10px;
+      background: rgba(255, 255, 255, 0.8);
+      font-size: 12px;
+      color: #27424a;
+      line-height: 1.35;
+      text-align: right;
+    }}
+    .checkpoint-badge strong {{
+      display: block;
+      color: #123a44;
+      font-size: 11px;
+      letter-spacing: 0.2px;
+      text-transform: uppercase;
+      margin-bottom: 2px;
     }}
     .panel {{
       border: 1px solid var(--line);
@@ -1100,6 +1131,7 @@ def index() -> str:
     }}
     @media (max-width: 900px) {{
       .wrap {{ width: min(1120px, 96vw); margin-top: 16px; }}
+      .checkpoint-badge {{ width: 100%; margin-left: 0; text-align: left; }}
       form {{ grid-template-columns: 1fr 1fr; }}
       .field-lastmod-start,
       .field-lastmod-end,
@@ -1142,21 +1174,27 @@ def index() -> str:
     }}
   </style>
 </head>
-<body>
+  <body>
   <main class="wrap">
     <section class="hero">
-      <h1>CVE Explorer</h1>
-      <p class="sub">Search by vendor/product and Last Modified range using normalized CPE mappings.</p>
+      <div class="hero-copy">
+        <h1>CVE Explorer</h1>
+        <p class="sub">Search by vendor/product and Last Modified range using normalized CPE mappings.</p>
+      </div>
+      <div class="checkpoint-badge">
+        <strong>최종 증분 수집 시각</strong>
+        {escape(checkpoint_text)}
+      </div>
     </section>
     <section class="panel">
       <form method="get">
         <div class="field-lastmod-start">
           <label for="last_modified_start">Last Modified Start</label>
-          <input id="last_modified_start" name="last_modified_start" type="datetime-local" value="{escape(last_modified_start_raw)}">
+          <input id="last_modified_start" name="last_modified_start" type="text" inputmode="numeric" placeholder="YYYY-MM-DDTHH:MM" pattern="\\d{{4}}-\\d{{2}}-\\d{{2}}T\\d{{2}}:\\d{{2}}" title="YYYY-MM-DDTHH:MM (24-hour)" value="{escape(last_modified_start_raw)}">
         </div>
         <div class="field-lastmod-end">
           <label for="last_modified_end">Last Modified End</label>
-          <input id="last_modified_end" name="last_modified_end" type="datetime-local" value="{escape(last_modified_end_raw)}">
+          <input id="last_modified_end" name="last_modified_end" type="text" inputmode="numeric" placeholder="YYYY-MM-DDTHH:MM" pattern="\\d{{4}}-\\d{{2}}-\\d{{2}}T\\d{{2}}:\\d{{2}}" title="YYYY-MM-DDTHH:MM (24-hour)" value="{escape(last_modified_end_raw)}">
         </div>
         <div class="field-cvss">
           <label for="min_cvss">Min CVSS</label>
