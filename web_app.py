@@ -1071,13 +1071,13 @@ def settings_page() -> str | object:
             "<input type='hidden' name='action' value='toggle_preset'>"
             f"<input type='hidden' name='preset_name' value='{escape(str(item['preset_name']))}'>"
             f"<input type='hidden' name='preset_enabled' value='{'0' if item['is_enabled'] else '1'}'>"
-            f"<button class='btn' type='submit'>{'비활성화' if item['is_enabled'] else '활성화'}</button>"
+            f"<button class='btn {'preset-disable-btn' if item['is_enabled'] else 'preset-enable-btn'}' type='submit'>{'비활성화' if item['is_enabled'] else '활성화'}</button>"
             "</form>"
             "<form method='post' style='display:inline-flex;margin-left:6px;'>"
             f"<input type='hidden' name='user_profile' value='{escape(user_profile)}'>"
             "<input type='hidden' name='action' value='delete_preset'>"
             f"<input type='hidden' name='preset_name' value='{escape(str(item['preset_name']))}'>"
-            "<button class='btn' type='submit'>삭제</button>"
+            "<button class='btn preset-delete-btn' type='submit'>삭제</button>"
             "</form>"
             "</td>"
             "</tr>"
@@ -1113,7 +1113,7 @@ def settings_page() -> str | object:
       color: var(--ink);
       background: radial-gradient(circle at 0% 0%, #fff9ef 0, #f7f4ee 58%);
     }}
-    .wrap {{ width: min(980px, 92vw); margin: 26px auto 54px; }}
+    .wrap {{ width: min(1600px, 90vw); margin: 34px auto 54px; }}
     .top-menu {{
       display: flex;
       gap: 10px;
@@ -1224,8 +1224,14 @@ def settings_page() -> str | object:
       grid-column: 1 / -1;
       display: flex;
       justify-content: flex-end;
+      align-items: center;
+      flex-wrap: wrap;
       gap: 8px;
       margin-top: 6px;
+    }}
+    .preset-name-input {{
+      width: 180px;
+      min-width: 160px;
     }}
     .btn {{
       text-decoration: none;
@@ -1238,6 +1244,31 @@ def settings_page() -> str | object:
       cursor: pointer;
       background: #fff;
       color: var(--ink);
+    }}
+    .btn.ghost {{
+      background: #f7f8f8;
+      border-color: #d8dedb;
+      color: #244149;
+    }}
+    .btn.warn {{
+      background: #fff2eb;
+      border-color: #efc0a8;
+      color: #8a3d1e;
+    }}
+    .preset-enable-btn {{
+      background: #e7f6ef;
+      border-color: #9ecfb9;
+      color: #0e6a4c;
+    }}
+    .preset-disable-btn {{
+      background: #fff0ea;
+      border-color: #efb8a3;
+      color: #8d3a21;
+    }}
+    .preset-delete-btn {{
+      background: #fff6f2;
+      border-color: #e8c8b9;
+      color: #8b4432;
     }}
     .btn.primary {{
       background: var(--accent-2);
@@ -1260,7 +1291,8 @@ def settings_page() -> str | object:
       form {{ grid-template-columns: 1fr; }}
       .header-row {{ flex-direction: column; align-items: flex-start; }}
       .actions {{ justify-content: stretch; }}
-      .btn {{ flex: 1; text-align: center; }}
+      .btn {{ flex: 1; text-align: center; min-width: 140px; }}
+      .preset-name-input {{ width: 100%; min-width: 0; }}
     }}
   </style>
 </head>
@@ -1350,11 +1382,11 @@ def settings_page() -> str | object:
           </div>
         </div>
         <div class="actions">
-          <a class="btn" href="/?user_profile={escape(user_profile)}">검색으로 이동</a>
-          <button class="btn" type="submit" name="action" value="reset">기본값 복원</button>
-          <input class="btn" name="preset_name" placeholder="프리셋 이름">
-          <button class="btn" type="submit" name="action" value="save_preset">현재값을 프리셋 저장</button>
-          <button class="btn" type="submit" name="action" value="preview">미리보기</button>
+          <a class="btn ghost" href="/?user_profile={escape(user_profile)}">검색으로 이동</a>
+          <button class="btn warn" type="submit" name="action" value="reset">기본값 복원</button>
+          <input class="preset-name-input" name="preset_name" placeholder="프리셋 이름">
+          <button class="btn ghost" type="submit" name="action" value="save_preset">현재값을 프리셋 저장</button>
+          <button class="btn ghost" type="submit" name="action" value="preview">미리보기</button>
           <button class="btn primary" type="submit">저장</button>
         </div>
       </form>
@@ -2918,6 +2950,18 @@ def daily_review() -> str | object:
         f"현재 표시 필터: {status_filter} (표시 {filtered_count}건)",
         f"활성 프리셋: {', '.join(item['preset_name'] for item in active_presets) if active_presets else '없음(프로필 기본 규칙 사용)'}",
     ]
+    daily_export_href = (
+        "/daily_export.xlsx?"
+        + urlencode(
+            {
+                "user_profile": user_profile,
+                "period_mode": period_mode,
+                "window_days": str(window_days),
+                "review_limit": str(review_limit),
+                "status_filter": status_filter,
+            }
+        )
+    )
     notice_html = f"<p class='ok-msg'>{escape(notice_text)}</p>" if notice_text else ""
     error_html = f"<p class='error-msg'>{escape(error_text)}</p>" if error_text else ""
     menu_html = _build_menu_html("daily", user_profile=user_profile)
@@ -2938,7 +2982,7 @@ def daily_review() -> str | object:
     }}
     * {{ box-sizing: border-box; }}
     body {{ margin: 0; font-family: "Space Grotesk", "Pretendard", sans-serif; color: var(--ink); background: var(--bg); }}
-    .wrap {{ width: min(1360px, 94vw); margin: 20px auto 40px; }}
+    .wrap {{ width: min(1600px, 90vw); margin: 34px auto 54px; }}
     .top-menu {{ display:flex; gap:10px; margin-bottom:12px; }}
     .menu-link {{ text-decoration:none; color:var(--ink); border:1px solid var(--line); background:#fff8ed; border-radius:999px; padding:8px 14px; font-size:13px; font-weight:700; }}
     .menu-link.active {{ color:#fff; background:var(--accent-2); border-color:var(--accent-2); }}
@@ -2950,6 +2994,20 @@ def daily_review() -> str | object:
     .toolbar label {{ font-size:12px; color:var(--muted); display:block; margin-bottom:4px; }}
     .toolbar select,.toolbar input {{ border:1px solid var(--line); border-radius:8px; padding:8px 10px; font:inherit; background:#fff; }}
     .toolbar button {{ border:1px solid var(--line); border-radius:8px; padding:8px 12px; font:inherit; font-weight:700; cursor:pointer; background:#fff; }}
+    .toolbar-link {{
+      text-decoration: none;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font: inherit;
+      font-weight: 700;
+      background: #f7f8f8;
+      color: #244149;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+    }}
     .bulk-toolbar {{ margin: 0 0 10px; }}
     .meta {{ margin: 8px 0 10px; font-size: 13px; color: var(--muted); }}
     .ok-msg {{ color:#0c6d57; font-size:13px; font-weight:700; margin: 4px 0; }}
@@ -3004,6 +3062,7 @@ def daily_review() -> str | object:
             <option value="ignored" {'selected' if status_filter == 'ignored' else ''}>제외</option>
           </select>
         </div>
+        <a class="toolbar-link" href="{escape(daily_export_href)}">엑셀 다운로드</a>
         <button type="submit">새로고침</button>
       </form>
       <form id="bulk-form" method="post" class="toolbar bulk-toolbar">
@@ -3064,6 +3123,175 @@ def daily_review() -> str | object:
 </script>
 </html>
 """
+
+
+@app.get("/daily_export.xlsx")
+def daily_export_xlsx() -> object:
+    user_profile = _normalize_user_profile(request.args.get("user_profile"))
+    period_mode = (request.args.get("period_mode") or "previous_day").strip().lower()
+    if period_mode not in {"previous_day", "last24h"}:
+        period_mode = "previous_day"
+    status_filter = (request.args.get("status_filter") or "pending").strip().lower()
+    if status_filter not in {"all", "pending", "reviewed", "ignored"}:
+        status_filter = "pending"
+
+    try:
+        settings_obj = load_settings(".env")
+        profile_defaults = fetch_profile_settings(settings_obj, user_profile)
+    except Exception as exc:  # pragma: no cover
+        return f"Failed to load settings: {exc}", 500
+
+    now_local = datetime.now().replace(second=0, microsecond=0)
+    window_days_raw = request.args.get("window_days") or str(profile_defaults["daily_review_window_days"])
+    try:
+        window_days = max(1, min(int(window_days_raw), 30))
+    except ValueError:
+        window_days = int(profile_defaults["daily_review_window_days"])
+    review_limit_raw = request.args.get("review_limit") or str(profile_defaults["daily_review_limit"])
+    try:
+        review_limit = max(1, min(int(review_limit_raw), 1000))
+    except ValueError:
+        review_limit = int(profile_defaults["daily_review_limit"])
+
+    if period_mode == "previous_day":
+        end_dt = now_local.replace(hour=0, minute=0)
+        start_dt = end_dt - timedelta(days=window_days)
+        review_date = (end_dt - timedelta(days=1)).date().isoformat()
+    else:
+        end_dt = now_local
+        start_dt = now_local - timedelta(hours=24 * window_days)
+        review_date = end_dt.date().isoformat()
+
+    try:
+        active_presets = [item for item in fetch_profile_presets(settings_obj, user_profile) if item["is_enabled"]]
+    except Exception:
+        active_presets = []
+
+    matched_preset_map: dict[str, list[str]] = {}
+    rows: list[dict[str, object]] = []
+    if active_presets:
+        merged_by_cve: dict[str, dict[str, object]] = {}
+        for preset in active_presets:
+            preset_name = str(preset["preset_name"])
+            rule = dict(preset["rule"])
+            preset_rows, _ = fetch_cves_from_db(
+                settings_obj,
+                str(rule["product"]) or None,
+                str(rule["vendor"]) or None,
+                str(rule["keyword"]) or None,
+                list(rule["impact_type"]) or None,
+                float(rule["min_cvss"]),
+                review_limit,
+                offset=0,
+                sort_by="last_modified",
+                sort_order="desc",
+                last_modified_start=start_dt,
+                last_modified_end=end_dt,
+                cpe_missing_only=bool(rule["cpe_missing_only"]),
+                cpe_objects=list(rule["cpe_objects_catalog"]) or None,
+                include_total_count=False,
+            )
+            for row in preset_rows:
+                cve_id = str(row.get("id", ""))
+                if not cve_id:
+                    continue
+                if cve_id not in merged_by_cve:
+                    merged_by_cve[cve_id] = row
+                matched_preset_map.setdefault(cve_id, [])
+                if preset_name not in matched_preset_map[cve_id]:
+                    matched_preset_map[cve_id].append(preset_name)
+        rows = list(merged_by_cve.values())
+        rows.sort(
+            key=lambda row: (
+                row.get("last_modified_at") or datetime.min,
+                float(row.get("cvss_score") or 0.0),
+            ),
+            reverse=True,
+        )
+        rows = rows[:review_limit]
+    else:
+        rows, _ = fetch_cves_from_db(
+            settings_obj,
+            str(profile_defaults["product"]) or None,
+            str(profile_defaults["vendor"]) or None,
+            str(profile_defaults["keyword"]) or None,
+            list(profile_defaults["impact_type"]) or None,
+            float(profile_defaults["min_cvss"]),
+            review_limit,
+            offset=0,
+            sort_by="last_modified",
+            sort_order="desc",
+            last_modified_start=start_dt,
+            last_modified_end=end_dt,
+            cpe_missing_only=bool(profile_defaults["cpe_missing_only"]),
+            cpe_objects=list(profile_defaults["cpe_objects_catalog"]) or None,
+            include_total_count=False,
+        )
+
+    review_map = fetch_daily_review_map(settings_obj, user_profile, review_date)
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Daily Review"
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sheet.append(["Generated At", generated_at])
+    sheet.append(["Profile", user_profile])
+    sheet.append(["Period Mode", period_mode])
+    sheet.append(["Window Days", str(window_days)])
+    sheet.append(["Status Filter", status_filter])
+    sheet.append([])
+    headers = ["CVE ID", "CVSS", "Type", "Last Modified", "Description", "Preset", "Review Status", "Review Note"]
+    sheet.append(headers)
+
+    header_row = sheet.max_row
+    for col in range(1, len(headers) + 1):
+        cell = sheet.cell(row=header_row, column=col)
+        cell.font = Font(bold=True, color="2F3F45")
+        cell.fill = PatternFill(fill_type="solid", start_color="F2EEE4", end_color="F2EEE4")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for row in rows:
+        cve_id = str(row.get("id", ""))
+        state = review_map.get(cve_id, {"status": "pending", "note": ""})
+        row_status = str(state.get("status", "pending"))
+        if status_filter != "all" and row_status != status_filter:
+            continue
+        sheet.append(
+            [
+                cve_id,
+                str(row.get("cvss_score") if row.get("cvss_score") is not None else "0.0"),
+                str(row.get("vuln_type", "Other")),
+                format_last_modified(row.get("last_modified_at", "N/A")),
+                str(row.get("description", "")),
+                ", ".join(matched_preset_map.get(cve_id, [])),
+                row_status,
+                str(state.get("note", "")),
+            ]
+        )
+
+    sheet.column_dimensions["A"].width = 22
+    sheet.column_dimensions["B"].width = 10
+    sheet.column_dimensions["C"].width = 24
+    sheet.column_dimensions["D"].width = 24
+    sheet.column_dimensions["E"].width = 90
+    sheet.column_dimensions["F"].width = 34
+    sheet.column_dimensions["G"].width = 14
+    sheet.column_dimensions["H"].width = 42
+
+    for row_idx in range(header_row + 1, sheet.max_row + 1):
+        sheet.cell(row=row_idx, column=5).alignment = Alignment(vertical="top", wrap_text=True)
+        sheet.cell(row=row_idx, column=8).alignment = Alignment(vertical="top", wrap_text=True)
+
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    filename = f"daily_review_{user_profile}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 def main() -> None:
