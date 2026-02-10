@@ -51,12 +51,14 @@ def index() -> str:
     vendor = (request.args.get("vendor") or "").strip()
     last_modified_start_raw = (request.args.get("last_modified_start") or "").strip()
     last_modified_end_raw = (request.args.get("last_modified_end") or "").strip()
+    cpe_missing_only = request.args.get("cpe_missing_only") == "1"
     selected_impacts = [value.strip() for value in request.args.getlist("impact_type") if value.strip()]
     no_filter_input = (
         not product
         and not vendor
         and not last_modified_start_raw
         and not last_modified_end_raw
+        and not cpe_missing_only
         and not selected_impacts
     )
     sort_map = {
@@ -122,6 +124,7 @@ def index() -> str:
                 sort_order=sort_order,
                 last_modified_start=last_modified_start,
                 last_modified_end=last_modified_end,
+                cpe_missing_only=cpe_missing_only,
             )
         except Exception as exc:  # pragma: no cover
             error_text = str(exc)
@@ -136,11 +139,22 @@ def index() -> str:
         summary = escape(shorten(description))
         full_description = escape(description)
         cpe_entries = row.get("cpe_entries") or []
-        cpe_badges = "".join(
-            f"<span class='cpe-chip'>{escape(str(cpe_value))}</span>" for cpe_value in cpe_entries[:10]
-        )
-        if not cpe_badges:
-            cpe_badges = "<span class='cpe-chip'>-</span>"
+        affected_guess = row.get("affected_products_guess") or []
+        if cpe_entries:
+            cpe_badges = "".join(
+                f"<span class='cpe-chip'>{escape(str(cpe_value))}</span>" for cpe_value in cpe_entries[:10]
+            )
+        else:
+            guess_badges = "".join(
+                f"<span class='cpe-chip guess-chip'>{escape(str(value))}</span>" for value in affected_guess[:8]
+            )
+            if not guess_badges:
+                guess_badges = "<span class='cpe-chip guess-chip'>No heuristic match</span>"
+            cpe_badges = (
+                "<span class='cpe-chip missing-chip'>CPE: none</span>"
+                "<div class='guess-title'>Estimated Affected</div>"
+                f"{guess_badges}"
+            )
         cpe_for_copy = escape(", ".join(str(cpe_value) for cpe_value in cpe_entries)) if cpe_entries else "-"
 
         row_chunks.append(
@@ -175,6 +189,8 @@ def index() -> str:
         base_query["last_modified_end"] = last_modified_end_raw
     if selected_impacts:
         base_query["impact_type"] = selected_impacts
+    if cpe_missing_only:
+        base_query["cpe_missing_only"] = "1"
 
     def build_sort_href(target: str) -> str:
         if target == "cvss":
@@ -205,6 +221,7 @@ def index() -> str:
         if selected_impacts
         else "<span class='impact-chip muted-chip'>No filter</span>"
     )
+    cpe_missing_checked = "checked" if cpe_missing_only else ""
 
     error_html = f"<p class='error'>Error: {escape(error_text)}</p>" if error_text else ""
 
@@ -418,6 +435,26 @@ def index() -> str:
     button:active {{ transform: translateY(1px); }}
     .search-btn {{ align-self: end; }}
     .field-cvss, .field-limit {{ max-width: 110px; }}
+    .field-cpe-missing {{
+      display: flex;
+      align-items: end;
+      padding-bottom: 8px;
+    }}
+    .field-cpe-missing label {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin: 0;
+      font-size: 13px;
+      color: #2f3f45;
+      cursor: pointer;
+    }}
+    .field-cpe-missing input[type="checkbox"] {{
+      width: 15px;
+      height: 15px;
+      margin: 0;
+      accent-color: #0f6f65;
+    }}
     .actions-bar {{
       display: flex;
       gap: 8px;
@@ -506,7 +543,7 @@ def index() -> str:
       color: #2d4658;
     }}
     .copy-btn:hover {{ filter: brightness(0.98); }}
-    .desc details {{ cursor: pointer; }}
+    .desc details {{ cursor: pointer; position: relative; }}
     .desc summary {{ color: #334b53; font-weight: 500; }}
     .desc summary:hover {{ color: #0f6f65; }}
     .detail-body {{
@@ -516,6 +553,10 @@ def index() -> str:
       border: 1px solid var(--line);
       background: #fff;
       line-height: 1.5;
+      width: min(920px, 82vw);
+      min-width: 520px;
+      max-width: 100%;
+      box-shadow: 0 10px 22px rgba(30, 43, 49, 0.12);
     }}
     .cpe-wrap {{ display: flex; flex-wrap: wrap; gap: 6px; }}
     .cpe-chip {{
@@ -527,6 +568,26 @@ def index() -> str:
       border-radius: 999px;
       font-size: 12px;
       white-space: nowrap;
+    }}
+    .missing-chip {{
+      border-color: #e7c3b8;
+      background: #fff2ee;
+      color: #9f3c25;
+      font-weight: 600;
+    }}
+    .guess-chip {{
+      border-color: #c9d5e1;
+      background: #eff4fa;
+      color: #2d4d67;
+    }}
+    .guess-title {{
+      width: 100%;
+      margin: 2px 0 0;
+      font-size: 11px;
+      color: #6b7471;
+      font-weight: 600;
+      letter-spacing: 0.2px;
+      text-transform: uppercase;
     }}
     @keyframes rise {{
       from {{ opacity: 0; transform: translateY(10px); }}
@@ -541,12 +602,17 @@ def index() -> str:
       .field-product,
       .field-cvss,
       .field-impact,
+      .field-cpe-missing,
       .field-limit {{
         grid-column: auto;
       }}
       .search-btn {{ grid-column: 1 / -1; }}
       .actions-bar {{ grid-column: 1 / -1; justify-content: flex-start; }}
       .impact-list {{ width: min(92vw, 360px); }}
+      .detail-body {{
+        width: 100%;
+        min-width: 0;
+      }}
       table, thead, tbody, th, td, tr {{ display: block; }}
       thead {{ display: none; }}
       td {{
@@ -600,6 +666,12 @@ def index() -> str:
         <div class="field-limit">
           <label for="limit">Limit (1-500)</label>
           <input id="limit" name="limit" type="number" min="1" max="500" step="1" value="{escape(str(limit))}">
+        </div>
+        <div class="field-cpe-missing">
+          <label for="cpe_missing_only">
+            <input id="cpe_missing_only" name="cpe_missing_only" type="checkbox" value="1" {cpe_missing_checked}>
+            CPE missing only
+          </label>
         </div>
         <div class="search-btn">
           <button type="submit">Search CVEs</button>

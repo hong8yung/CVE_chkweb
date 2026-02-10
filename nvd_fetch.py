@@ -1,4 +1,5 @@
 import argparse
+from urllib.parse import urlparse
 from typing import Any
 
 import psycopg2
@@ -17,6 +18,7 @@ def fetch_cves_from_db(
     sort_order: str = "desc",
     last_modified_start: Any | None = None,
     last_modified_end: Any | None = None,
+    cpe_missing_only: bool = False,
 ) -> list[dict[str, Any]]:
     where_clauses = [
         "c.cvss_score >= %s",
@@ -73,6 +75,17 @@ def fetch_cves_from_db(
     if last_modified_end is not None:
         where_clauses.append("c.last_modified_at <= %s")
         params.append(last_modified_end)
+    if cpe_missing_only:
+        where_clauses.append(
+            """
+            NOT EXISTS (
+                SELECT 1
+                FROM cve_cpe AS f
+                WHERE f.cve_id = c.id
+                  AND f.vulnerable = TRUE
+            )
+            """
+        )
 
     where_sql = " AND ".join(where_clauses)
     sort_key = (sort_by or "cvss").lower()
@@ -124,6 +137,8 @@ def fetch_cves_from_db(
     parsed_rows: list[dict[str, Any]] = []
     for cve_id, cvss_score, last_modified_at, impact, raw, cpe_entries in rows:
         description = extract_english_description(raw)
+        normalized_cpe_entries = cpe_entries or []
+        affected_guess = [] if normalized_cpe_entries else extract_affected_product_guesses(raw)
         parsed_rows.append(
             {
                 "id": cve_id,
@@ -131,10 +146,91 @@ def fetch_cves_from_db(
                 "last_modified_at": last_modified_at,
                 "description": description,
                 "vuln_type": impact or "Other",
-                "cpe_entries": cpe_entries or [],
+                "cpe_entries": normalized_cpe_entries,
+                "affected_products_guess": affected_guess,
             }
         )
     return parsed_rows
+
+
+def extract_affected_product_guesses(raw_item: Any, max_items: int = 8) -> list[str]:
+    cpe_like = extract_cpe_like_values_from_raw(raw_item)
+    if cpe_like:
+        return cpe_like[:max_items]
+
+    hosts = extract_reference_hosts(raw_item)
+    if hosts:
+        return [f"ref:{host}" for host in hosts[:max_items]]
+
+    return []
+
+
+def extract_cpe_like_values_from_raw(raw_item: Any) -> list[str]:
+    found: list[str] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            criteria = value.get("criteria")
+            if isinstance(criteria, str) and criteria.startswith("cpe:2.3:"):
+                parsed = parse_cpe_23(criteria)
+                if parsed:
+                    found.append(parsed)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(raw_item)
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in found:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
+def parse_cpe_23(cpe_value: str) -> str | None:
+    parts = cpe_value.split(":")
+    if len(parts) < 6:
+        return None
+    vendor = parts[3].strip()
+    product = parts[4].strip()
+    version = parts[5].strip()
+    if vendor in {"*", "-"} or product in {"*", "-"}:
+        return None
+    if version and version not in {"*", "-"}:
+        return f"{vendor}:{product}:{version}"
+    return f"{vendor}:{product}"
+
+
+def extract_reference_hosts(raw_item: Any) -> list[str]:
+    if not isinstance(raw_item, dict):
+        return []
+    cve = raw_item.get("cve", {})
+    references = cve.get("references", [])
+    if not isinstance(references, list):
+        return []
+
+    hosts: list[str] = []
+    seen: set[str] = set()
+    for ref in references:
+        if not isinstance(ref, dict):
+            continue
+        url = ref.get("url")
+        if not isinstance(url, str) or not url:
+            continue
+        host = (urlparse(url).hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        hosts.append(host)
+    return hosts
 
 
 def extract_english_description(raw_item: Any) -> str:
@@ -187,6 +283,11 @@ def main() -> None:
         default=None,
         help="Upper bound of last_modified_at (ISO datetime, e.g. 2025-12-31T23:59:59)",
     )
+    parser.add_argument(
+        "--cpe-missing-only",
+        action="store_true",
+        help="Return only CVEs without vulnerable CPE mappings",
+    )
     parser.add_argument("--config", default=".env", help="Path to settings file")
     args = parser.parse_args()
     product = (args.product or "").strip() or None
@@ -206,6 +307,7 @@ def main() -> None:
         sort_order=args.sort_order,
         last_modified_start=args.last_modified_start,
         last_modified_end=args.last_modified_end,
+        cpe_missing_only=args.cpe_missing_only,
     )
 
     print_cves(cves, args.min_cvss)

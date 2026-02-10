@@ -9,3 +9,4 @@
 ## Query
 
 - [ ] `nvd_fetch.py` / 웹 조회에 description 옵션 검색(`--search-desc`) 추가하고, 결과에 `match_source`(`cpe`/`description`) 표시
+- [ ] CPE 누락 CVE용 `affected_products_guess` DB화: 스키마(`text[]` + confidence/source) 추가, 백필 유틸 작성, 웹/CLI 검색 필터 연동

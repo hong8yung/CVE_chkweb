@@ -53,28 +53,66 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+get_port_pids() {
+  local pids=""
+  if command -v lsof >/dev/null 2>&1; then
+    pids="$(lsof -ti "tcp:${PORT}" 2>/dev/null | tr '\n' ' ' | xargs 2>/dev/null || true)"
+  fi
+  if [[ -z "$pids" ]] && command -v fuser >/dev/null 2>&1; then
+    pids="$(fuser -n tcp "$PORT" 2>/dev/null | tr '\n' ' ' | xargs 2>/dev/null || true)"
+  fi
+  echo "$pids"
+}
+
 is_running() {
-  [[ -f "$PID_FILE" ]] || return 1
-  local pid
-  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  [[ -n "$pid" ]] || return 1
-  kill -0 "$pid" 2>/dev/null
+  if [[ -f "$PID_FILE" ]]; then
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  fi
+
+  local port_pids
+  port_pids="$(get_port_pids)"
+  if [[ -n "$port_pids" ]]; then
+    # Adopt an existing listener started outside this script.
+    echo "$port_pids" | awk '{print $1}' > "$PID_FILE"
+    return 0
+  fi
+  return 1
 }
 
 stop_app() {
-  if ! is_running; then
+  local known_pid=""
+  local port_pids=""
+  local target_pids=""
+
+  if [[ -f "$PID_FILE" ]]; then
+    known_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  fi
+  port_pids="$(get_port_pids)"
+  target_pids="$(printf "%s %s\n" "$known_pid" "$port_pids" | tr ' ' '\n' | sed '/^$/d' | sort -u | xargs 2>/dev/null || true)"
+
+  if [[ -z "$target_pids" ]]; then
     rm -f "$PID_FILE"
     echo "web_app is not running."
     return 0
   fi
 
-  local pid
-  pid="$(cat "$PID_FILE")"
-  echo "Stopping web_app (pid=$pid)..."
-  kill "$pid" 2>/dev/null || true
+  echo "Stopping web_app (pid=${target_pids})..."
+  # shellcheck disable=SC2086
+  kill $target_pids 2>/dev/null || true
 
+  local still_running=""
   for _ in {1..20}; do
-    if ! kill -0 "$pid" 2>/dev/null; then
+    still_running=""
+    for pid in $target_pids; do
+      if kill -0 "$pid" 2>/dev/null; then
+        still_running="${still_running} ${pid}"
+      fi
+    done
+    if [[ -z "${still_running// }" ]]; then
       rm -f "$PID_FILE"
       echo "Stopped."
       return 0
@@ -82,15 +120,21 @@ stop_app() {
     sleep 0.2
   done
 
-  echo "Force killing web_app (pid=$pid)..."
-  kill -9 "$pid" 2>/dev/null || true
+  still_running="$(echo "$still_running" | xargs 2>/dev/null || true)"
+  if [[ -n "$still_running" ]]; then
+    echo "Force killing web_app (pid=${still_running})..."
+    # shellcheck disable=SC2086
+    kill -9 $still_running 2>/dev/null || true
+  fi
   rm -f "$PID_FILE"
   echo "Stopped (forced)."
 }
 
 start_app() {
   if is_running; then
-    echo "web_app is already running (pid=$(cat "$PID_FILE"))."
+    local running_pid
+    running_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    echo "web_app is already running (pid=${running_pid})."
     return 0
   fi
 
@@ -114,7 +158,9 @@ start_app() {
 
 status_app() {
   if is_running; then
-    echo "Running (pid=$(cat "$PID_FILE"))."
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    echo "Running (pid=${pid}, port=${PORT})."
   else
     echo "Not running."
   fi
