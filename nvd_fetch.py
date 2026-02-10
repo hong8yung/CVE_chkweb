@@ -1,5 +1,4 @@
 import argparse
-from urllib.parse import urlparse
 from typing import Any
 
 import psycopg2
@@ -137,8 +136,6 @@ def fetch_cves_from_db(
     parsed_rows: list[dict[str, Any]] = []
     for cve_id, cvss_score, last_modified_at, impact, raw, cpe_entries in rows:
         description = extract_english_description(raw)
-        normalized_cpe_entries = cpe_entries or []
-        affected_guess = [] if normalized_cpe_entries else extract_affected_product_guesses(raw)
         parsed_rows.append(
             {
                 "id": cve_id,
@@ -146,91 +143,10 @@ def fetch_cves_from_db(
                 "last_modified_at": last_modified_at,
                 "description": description,
                 "vuln_type": impact or "Other",
-                "cpe_entries": normalized_cpe_entries,
-                "affected_products_guess": affected_guess,
+                "cpe_entries": cpe_entries or [],
             }
         )
     return parsed_rows
-
-
-def extract_affected_product_guesses(raw_item: Any, max_items: int = 8) -> list[str]:
-    cpe_like = extract_cpe_like_values_from_raw(raw_item)
-    if cpe_like:
-        return cpe_like[:max_items]
-
-    hosts = extract_reference_hosts(raw_item)
-    if hosts:
-        return [f"ref:{host}" for host in hosts[:max_items]]
-
-    return []
-
-
-def extract_cpe_like_values_from_raw(raw_item: Any) -> list[str]:
-    found: list[str] = []
-
-    def walk(value: Any) -> None:
-        if isinstance(value, dict):
-            criteria = value.get("criteria")
-            if isinstance(criteria, str) and criteria.startswith("cpe:2.3:"):
-                parsed = parse_cpe_23(criteria)
-                if parsed:
-                    found.append(parsed)
-            for child in value.values():
-                walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-
-    walk(raw_item)
-
-    unique: list[str] = []
-    seen: set[str] = set()
-    for item in found:
-        if item in seen:
-            continue
-        seen.add(item)
-        unique.append(item)
-    return unique
-
-
-def parse_cpe_23(cpe_value: str) -> str | None:
-    parts = cpe_value.split(":")
-    if len(parts) < 6:
-        return None
-    vendor = parts[3].strip()
-    product = parts[4].strip()
-    version = parts[5].strip()
-    if vendor in {"*", "-"} or product in {"*", "-"}:
-        return None
-    if version and version not in {"*", "-"}:
-        return f"{vendor}:{product}:{version}"
-    return f"{vendor}:{product}"
-
-
-def extract_reference_hosts(raw_item: Any) -> list[str]:
-    if not isinstance(raw_item, dict):
-        return []
-    cve = raw_item.get("cve", {})
-    references = cve.get("references", [])
-    if not isinstance(references, list):
-        return []
-
-    hosts: list[str] = []
-    seen: set[str] = set()
-    for ref in references:
-        if not isinstance(ref, dict):
-            continue
-        url = ref.get("url")
-        if not isinstance(url, str) or not url:
-            continue
-        host = (urlparse(url).hostname or "").lower()
-        if host.startswith("www."):
-            host = host[4:]
-        if not host or host in seen:
-            continue
-        seen.add(host)
-        hosts.append(host)
-    return hosts
 
 
 def extract_english_description(raw_item: Any) -> str:

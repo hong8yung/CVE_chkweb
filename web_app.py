@@ -139,22 +139,11 @@ def index() -> str:
         summary = escape(shorten(description))
         full_description = escape(description)
         cpe_entries = row.get("cpe_entries") or []
-        affected_guess = row.get("affected_products_guess") or []
-        if cpe_entries:
-            cpe_badges = "".join(
-                f"<span class='cpe-chip'>{escape(str(cpe_value))}</span>" for cpe_value in cpe_entries[:10]
-            )
-        else:
-            guess_badges = "".join(
-                f"<span class='cpe-chip guess-chip'>{escape(str(value))}</span>" for value in affected_guess[:8]
-            )
-            if not guess_badges:
-                guess_badges = "<span class='cpe-chip guess-chip'>No heuristic match</span>"
-            cpe_badges = (
-                "<span class='cpe-chip missing-chip'>CPE: none</span>"
-                "<div class='guess-title'>Estimated Affected</div>"
-                f"{guess_badges}"
-            )
+        cpe_badges = "".join(
+            f"<span class='cpe-chip'>{escape(str(cpe_value))}</span>" for cpe_value in cpe_entries[:10]
+        )
+        if not cpe_badges:
+            cpe_badges = "<span class='cpe-chip'>-</span>"
         cpe_for_copy = escape(", ".join(str(cpe_value) for cpe_value in cpe_entries)) if cpe_entries else "-"
 
         row_chunks.append(
@@ -568,26 +557,6 @@ def index() -> str:
       border-radius: 999px;
       font-size: 12px;
       white-space: nowrap;
-    }}
-    .missing-chip {{
-      border-color: #e7c3b8;
-      background: #fff2ee;
-      color: #9f3c25;
-      font-weight: 600;
-    }}
-    .guess-chip {{
-      border-color: #c9d5e1;
-      background: #eff4fa;
-      color: #2d4d67;
-    }}
-    .guess-title {{
-      width: 100%;
-      margin: 2px 0 0;
-      font-size: 11px;
-      color: #6b7471;
-      font-weight: 600;
-      letter-spacing: 0.2px;
-      text-transform: uppercase;
     }}
     @keyframes rise {{
       from {{ opacity: 0; transform: translateY(10px); }}
