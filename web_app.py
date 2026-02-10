@@ -3518,6 +3518,18 @@ def daily_review() -> str | object:
       animation: rowGlow 1.2s ease-out;
       box-shadow: inset 0 0 0 2px rgba(15, 111, 101, 0.22);
     }}
+    .review-row.row-selected td {{
+      background: #edf6f2;
+    }}
+    .review-row.row-selected .sticky-col {{
+      background: #e5f2ec;
+    }}
+    .review-row.row-active td {{
+      box-shadow: inset 0 0 0 2px rgba(29, 87, 79, 0.52);
+    }}
+    .review-row.row-active {{
+      animation: activeRowGlow 1.2s ease-in-out infinite alternate;
+    }}
     .view-btn {{
       margin-left: 6px;
       width: auto;
@@ -3607,6 +3619,10 @@ def daily_review() -> str | object:
     @keyframes rowGlow {{
       0% {{ background: #e9f8f3; }}
       100% {{ background: #fffdf8; }}
+    }}
+    @keyframes activeRowGlow {{
+      0% {{ filter: drop-shadow(0 0 0 rgba(38, 133, 113, 0)); }}
+      100% {{ filter: drop-shadow(0 0 6px rgba(38, 133, 113, 0.35)); }}
     }}
   </style>
 </head>
@@ -3710,22 +3726,98 @@ def daily_review() -> str | object:
     const descDrawerBody = document.querySelector("#daily-desc-drawer-body");
     const descDrawerTitle = document.querySelector("#daily-desc-drawer-title");
     const descDrawerClose = document.querySelector("#daily-desc-drawer-close");
+    let activeRowIndex = -1;
+    let selectionAnchorIndex = -1;
+    const isTypingTarget = (target) => {{
+      if (!target || !(target instanceof Element)) return false;
+      if (target.closest("#daily-desc-drawer")) return true;
+      if (target.closest("input, select, textarea, button, a")) return true;
+      return !!target.isContentEditable;
+    }};
+    const setActiveRow = (index, focusRow = false, setAnchor = false) => {{
+      if (index < 0 || index >= reviewRows.length) return;
+      reviewRows.forEach((row, idx) => {{
+        row.classList.toggle("row-active", idx === index);
+      }});
+      activeRowIndex = index;
+      if (setAnchor) {{
+        selectionAnchorIndex = index;
+      }}
+      const row = reviewRows[index];
+      if (focusRow && row) {{
+        row.focus({{ preventScroll: true }});
+        row.scrollIntoView({{ block: "nearest" }});
+      }}
+    }};
+    const renderDrawer = (cve, desc) => {{
+      if (!descDrawer || !descDrawerBody || !descDrawerTitle) {{
+        return;
+      }}
+      descDrawerTitle.textContent = cve || "CVE";
+      descDrawerBody.textContent = desc || "";
+      descDrawer.classList.add("open");
+      descDrawer.setAttribute("aria-hidden", "false");
+    }};
+    const syncDrawerToActiveRow = () => {{
+      if (!descDrawer || !descDrawer.classList.contains("open")) {{
+        return;
+      }}
+      if (activeRowIndex < 0 || activeRowIndex >= reviewRows.length) {{
+        return;
+      }}
+      const viewBtn = reviewRows[activeRowIndex].querySelector(".view-btn");
+      if (!viewBtn) {{
+        return;
+      }}
+      renderDrawer(viewBtn.dataset.cve || "CVE", viewBtn.dataset.desc || "");
+    }};
+    const applyRangeSelection = (fromIndex, toIndex, checkedValue) => {{
+      if (!reviewRows.length) return;
+      const start = Math.max(0, Math.min(fromIndex, toIndex));
+      const end = Math.min(reviewRows.length - 1, Math.max(fromIndex, toIndex));
+      for (let idx = start; idx <= end; idx += 1) {{
+        const checkbox = reviewRows[idx].querySelector(".bulk-cve-check");
+        if (!checkbox || checkbox.checked === checkedValue) continue;
+        checkbox.checked = checkedValue;
+        checkbox.dispatchEvent(new Event("change", {{ bubbles: true }}));
+      }}
+    }};
+    const syncRowSelected = (checkbox) => {{
+      const row = checkbox?.closest("tr.review-row");
+      if (!row) return;
+      row.classList.toggle("row-selected", !!checkbox.checked);
+    }};
+    const syncAllSelectedRows = () => {{
+      checks().forEach((checkbox) => syncRowSelected(checkbox));
+    }};
     selectAll?.addEventListener("change", () => {{
       const checked = !!selectAll.checked;
       checks().forEach((el) => {{
         el.checked = checked;
+        syncRowSelected(el);
       }});
     }});
     checks().forEach((el) => {{
       el.addEventListener("change", () => {{
+        syncRowSelected(el);
+        const changedRow = el.closest("tr.review-row");
+        if (changedRow) {{
+          const rowIndex = reviewRows.indexOf(changedRow);
+          if (rowIndex >= 0) setActiveRow(rowIndex, false, false);
+        }}
         const all = checks();
         if (!all.length || !selectAll) return;
         selectAll.checked = all.every((x) => x.checked);
       }});
     }});
     reviewRows.forEach((row) => {{
+      row.setAttribute("tabindex", "-1");
+    }});
+    reviewRows.forEach((row) => {{
       row.addEventListener("click", (event) => {{
         const target = event.target;
+        const rowIndex = reviewRows.indexOf(row);
+        if (rowIndex >= 0) setActiveRow(rowIndex, false, true);
         if (
           target.closest("button")
           || target.closest("a")
@@ -3743,6 +3835,44 @@ def daily_review() -> str | object:
         checkbox.checked = !checkbox.checked;
         checkbox.dispatchEvent(new Event("change", {{ bubbles: true }}));
       }});
+    }});
+    syncAllSelectedRows();
+    document.addEventListener("keydown", (event) => {{
+      const isArrow = event.key === "ArrowDown" || event.key === "ArrowUp";
+      const isSpace = event.key === " " || event.key === "Spacebar" || event.code === "Space";
+      if (!isArrow && !isSpace) {{
+        return;
+      }}
+      if (isTypingTarget(event.target)) {{
+        return;
+      }}
+      if (!reviewRows.length) {{
+        return;
+      }}
+      event.preventDefault();
+      if (isArrow) {{
+        const baseIndex = activeRowIndex >= 0 ? activeRowIndex : 0;
+        const delta = event.key === "ArrowDown" ? 1 : -1;
+        const nextIndex = Math.max(0, Math.min(reviewRows.length - 1, baseIndex + delta));
+        const isRangeSelect = !!event.shiftKey;
+        if (isRangeSelect) {{
+          const anchor = selectionAnchorIndex >= 0 ? selectionAnchorIndex : baseIndex;
+          setActiveRow(nextIndex, true, false);
+          applyRangeSelection(anchor, nextIndex, true);
+        }} else {{
+          setActiveRow(nextIndex, true, true);
+        }}
+        syncDrawerToActiveRow();
+        return;
+      }}
+      const targetIndex = activeRowIndex >= 0 ? activeRowIndex : 0;
+      setActiveRow(targetIndex, true, true);
+      const checkbox = reviewRows[targetIndex].querySelector(".bulk-cve-check");
+      if (!checkbox) {{
+        return;
+      }}
+      checkbox.checked = !checkbox.checked;
+      checkbox.dispatchEvent(new Event("change", {{ bubbles: true }}));
     }});
     const bulkForm = document.querySelector("#bulk-form");
     bulkForm?.addEventListener("submit", (event) => {{
@@ -3783,15 +3913,12 @@ def daily_review() -> str | object:
     }}
     viewButtons.forEach((btn) => {{
       btn.addEventListener("click", () => {{
-        const cve = btn.dataset.cve || "CVE";
-        const desc = btn.dataset.desc || "";
-        if (!descDrawer || !descDrawerBody || !descDrawerTitle) {{
-          return;
+        const row = btn.closest("tr.review-row");
+        const rowIndex = row ? reviewRows.indexOf(row) : -1;
+        if (rowIndex >= 0) {{
+          setActiveRow(rowIndex, false, true);
         }}
-        descDrawerTitle.textContent = cve;
-        descDrawerBody.textContent = desc;
-        descDrawer.classList.add("open");
-        descDrawer.setAttribute("aria-hidden", "false");
+        renderDrawer(btn.dataset.cve || "CVE", btn.dataset.desc || "");
       }});
     }});
     descDrawerClose?.addEventListener("click", () => {{
