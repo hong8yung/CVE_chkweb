@@ -1,4 +1,5 @@
 import argparse
+import math
 from typing import Any
 
 import psycopg2
@@ -14,12 +15,14 @@ def fetch_cves_from_db(
     impact_types: list[str] | None,
     min_cvss: float,
     limit: int,
+    offset: int = 0,
     sort_by: str = "cvss",
     sort_order: str = "desc",
     last_modified_start: Any | None = None,
     last_modified_end: Any | None = None,
     cpe_missing_only: bool = False,
-) -> list[dict[str, Any]]:
+    include_total_count: bool = True,
+) -> tuple[list[dict[str, Any]], int | None]:
     where_clauses = [
         "c.cvss_score >= %s",
     ]
@@ -142,8 +145,13 @@ def fetch_cves_from_db(
     GROUP BY c.id, c.cvss_score, c.last_modified_at, c.impact_type, c.raw, c.published_at
     ORDER BY {order_by_sql}
     LIMIT %s
+    OFFSET %s
     """
-    params.append(limit)
+    count_sql = f"""
+    SELECT COUNT(*)::int
+    FROM cve AS c
+    WHERE {where_sql}
+    """
 
     conn = psycopg2.connect(
         host=settings.db_host,
@@ -152,9 +160,17 @@ def fetch_cves_from_db(
         user=settings.db_user,
         password=settings.db_password,
     )
+    total_count: int | None = None
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, params)
+            if include_total_count:
+                cur.execute(count_sql, params)
+                total_count = int(cur.fetchone()[0])
+
+            query_params = list(params)
+            query_params.append(limit)
+            query_params.append(max(0, offset))
+            cur.execute(sql, query_params)
             rows = cur.fetchall()
     finally:
         conn.close()
@@ -172,7 +188,7 @@ def fetch_cves_from_db(
                 "cpe_entries": cpe_entries or [],
             }
         )
-    return parsed_rows
+    return parsed_rows, total_count
 
 
 def extract_english_description(raw_item: Any) -> str:
@@ -188,8 +204,8 @@ def extract_english_description(raw_item: Any) -> str:
     return ""
 
 
-def print_cves(cves: list[dict[str, Any]], min_cvss: float) -> None:
-    print(f"Filtered CVEs (min CVSS {min_cvss}): {len(cves)}")
+def print_cves(cves: list[dict[str, Any]], min_cvss: float, total_count: int) -> None:
+    print(f"Filtered CVEs (min CVSS {min_cvss}): total {total_count}, showing {len(cves)}")
     for item in cves:
         cve_id = str(item.get("id", "UNKNOWN"))
         score = item.get("cvss_score")
@@ -214,6 +230,7 @@ def main() -> None:
     parser.add_argument("--impact-type", default=None, help="Impact type filter, e.g., Remote Code Execution")
     parser.add_argument("--min-cvss", type=float, default=0.0, help="Minimum CVSS score")
     parser.add_argument("--limit", type=int, default=50, help="Maximum number of rows to print")
+    parser.add_argument("--page", type=int, default=1, help="Page number (1-based)")
     parser.add_argument("--sort-by", default="cvss", choices=["cvss", "last_modified"], help="Sort field")
     parser.add_argument("--sort-order", default="desc", choices=["asc", "desc"], help="Sort order")
     parser.add_argument(
@@ -240,7 +257,9 @@ def main() -> None:
     impact_types = [impact_type] if impact_type else None
 
     settings = load_settings(args.config)
-    cves = fetch_cves_from_db(
+    page = max(1, args.page)
+    offset = (page - 1) * max(1, args.limit)
+    cves, total_count = fetch_cves_from_db(
         settings,
         product,
         vendor,
@@ -248,14 +267,19 @@ def main() -> None:
         impact_types,
         args.min_cvss,
         args.limit,
+        offset=offset,
         sort_by=args.sort_by,
         sort_order=args.sort_order,
         last_modified_start=args.last_modified_start,
         last_modified_end=args.last_modified_end,
         cpe_missing_only=args.cpe_missing_only,
+        include_total_count=True,
     )
 
-    print_cves(cves, args.min_cvss)
+    print_cves(cves, args.min_cvss, total_count or 0)
+    if total_count is not None:
+        total_pages = max(1, math.ceil(total_count / max(1, args.limit)))
+        print(f"Page: {page}/{total_pages}")
 
 
 if __name__ == "__main__":

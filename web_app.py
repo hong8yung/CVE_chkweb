@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import math
+import time
 from datetime import datetime
 from html import escape
 from urllib.parse import urlencode
@@ -12,6 +14,52 @@ from nvd_fetch import fetch_cves_from_db
 from settings import load_settings
 
 app = Flask(__name__)
+
+COUNT_CACHE_TTL_SECONDS = 120
+COUNT_CACHE_MAX_ENTRIES = 200
+_count_cache: dict[str, tuple[int, float]] = {}
+
+
+def _build_count_cache_key(
+    product: str,
+    vendor: str,
+    keyword: str,
+    selected_impacts: list[str],
+    min_cvss: float,
+    last_modified_start_raw: str,
+    last_modified_end_raw: str,
+    cpe_missing_only: bool,
+) -> str:
+    return "|".join(
+        [
+            product.lower(),
+            vendor.lower(),
+            keyword.lower(),
+            ",".join(sorted(value.lower() for value in selected_impacts)),
+            f"{min_cvss:.1f}",
+            last_modified_start_raw,
+            last_modified_end_raw,
+            "1" if cpe_missing_only else "0",
+        ]
+    )
+
+
+def _get_cached_count(key: str) -> int | None:
+    cached = _count_cache.get(key)
+    if not cached:
+        return None
+    value, ts = cached
+    if time.time() - ts > COUNT_CACHE_TTL_SECONDS:
+        _count_cache.pop(key, None)
+        return None
+    return value
+
+
+def _set_cached_count(key: str, value: int) -> None:
+    if len(_count_cache) >= COUNT_CACHE_MAX_ENTRIES:
+        oldest_key = min(_count_cache.items(), key=lambda item: item[1][1])[0]
+        _count_cache.pop(oldest_key, None)
+    _count_cache[key] = (value, time.time())
 
 
 def format_cvss_badge(score: object) -> tuple[str, str]:
@@ -100,6 +148,15 @@ def index() -> str:
     except ValueError:
         limit = 50
     limit = max(1, min(limit, 500))
+
+    page_raw = (request.args.get("page") or "1").strip()
+    try:
+        page = int(page_raw)
+    except ValueError:
+        page = 1
+    page = max(1, page)
+    offset = (page - 1) * limit
+
     no_filter_input = no_filter_input and (min_cvss == 0.0) and (limit == 50)
 
     if sort_key_param:
@@ -111,7 +168,20 @@ def index() -> str:
     last_modified_start: datetime | None = None
     last_modified_end: datetime | None = None
     rows: list[dict[str, object]] = []
+    total_count = 0
     error_text = ""
+    count_cache_key = _build_count_cache_key(
+        product,
+        vendor,
+        keyword,
+        selected_impacts,
+        min_cvss,
+        last_modified_start_raw,
+        last_modified_end_raw,
+        cpe_missing_only,
+    )
+    cached_total = _get_cached_count(count_cache_key)
+    should_fetch_total_count = (page == 1) or (cached_total is None)
 
     try:
         if last_modified_start_raw:
@@ -132,7 +202,7 @@ def index() -> str:
     if not error_text:
         try:
             settings = load_settings(".env")
-            rows = fetch_cves_from_db(
+            rows, total_count = fetch_cves_from_db(
                 settings,
                 product,
                 vendor or None,
@@ -140,12 +210,18 @@ def index() -> str:
                 selected_impacts or None,
                 min_cvss,
                 limit,
+                offset=offset,
                 sort_by=sort_by,
                 sort_order=sort_order,
                 last_modified_start=last_modified_start,
                 last_modified_end=last_modified_end,
                 cpe_missing_only=cpe_missing_only,
+                include_total_count=should_fetch_total_count,
             )
+            if total_count is None:
+                total_count = cached_total or 0
+            else:
+                _set_cached_count(count_cache_key, total_count)
         except Exception as exc:  # pragma: no cover
             error_text = str(exc)
 
@@ -193,6 +269,7 @@ def index() -> str:
         "keyword": keyword,
         "min_cvss": str(min_cvss),
         "limit": str(limit),
+        "page": str(page),
     }
     if last_modified_start_raw:
         base_query["last_modified_start"] = last_modified_start_raw
@@ -233,6 +310,47 @@ def index() -> str:
         else "<span class='impact-chip muted-chip'>No filter</span>"
     )
     cpe_missing_checked = "checked" if cpe_missing_only else ""
+    total_pages = max(1, math.ceil(total_count / limit)) if total_count > 0 else 1
+    if page > total_pages:
+        page = total_pages
+    page_start = max(1, page - 2)
+    page_end = min(total_pages, page + 2)
+    pager_links: list[str] = []
+    for page_no in range(page_start, page_end + 1):
+        page_query = dict(base_query)
+        page_query["page"] = str(page_no)
+        page_href = "?" + urlencode(page_query, doseq=True)
+        if page_no == page:
+            pager_links.append(f"<span class='page-link current'>{page_no}</span>")
+        else:
+            pager_links.append(f"<a class='page-link' href='{escape(page_href)}'>{page_no}</a>")
+    prev_href = ""
+    next_href = ""
+    if page > 1:
+        prev_query = dict(base_query)
+        prev_query["page"] = str(page - 1)
+        prev_href = "?" + urlencode(prev_query, doseq=True)
+    if page < total_pages:
+        next_query = dict(base_query)
+        next_query["page"] = str(page + 1)
+        next_href = "?" + urlencode(next_query, doseq=True)
+    prev_link_html = (
+        f"<a class='page-link' href='{escape(prev_href)}'>Prev</a>"
+        if prev_href
+        else "<span class='page-link disabled'>Prev</span>"
+    )
+    next_link_html = (
+        f"<a class='page-link' href='{escape(next_href)}'>Next</a>"
+        if next_href
+        else "<span class='page-link disabled'>Next</span>"
+    )
+    pager_html = (
+        "<div class='pager'>"
+        f"{prev_link_html}"
+        f"{''.join(pager_links)}"
+        f"{next_link_html}"
+        "</div>"
+    )
 
     error_html = f"<p class='error'>Error: {escape(error_text)}</p>" if error_text else ""
 
@@ -497,6 +615,39 @@ def index() -> str:
       padding: 12px 16px 4px;
       color: var(--muted);
       font-size: 13px;
+      text-align: right;
+    }}
+    .pager {{
+      margin: 8px 16px 0;
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }}
+    .page-link {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 32px;
+      padding: 5px 9px;
+      border: 1px solid #ccd6d3;
+      border-radius: 8px;
+      background: #fff;
+      color: #1f4048;
+      text-decoration: none;
+      font-size: 12px;
+      font-weight: 600;
+    }}
+    .page-link.current {{
+      background: #e5f3ef;
+      border-color: #9ec2b8;
+      color: #0f6f65;
+    }}
+    .page-link.disabled {{
+      background: #f1f3f2;
+      border-color: #d9dfdc;
+      color: #9aa4a1;
     }}
     .error {{
       margin: 8px 16px 0;
@@ -641,7 +792,10 @@ def index() -> str:
       padding: 3px 7px;
       border-radius: 999px;
       font-size: 12px;
-      white-space: nowrap;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      max-width: 100%;
     }}
     @keyframes rise {{
       from {{ opacity: 0; transform: translateY(10px); }}
@@ -752,7 +906,8 @@ def index() -> str:
           <button id="share-url-btn" type="button" class="secondary-btn">Share URL</button>
         </div>
       </form>
-      <p class="meta">Results: {len(rows)}</p>
+      <p class="meta">Results: {total_count} total (showing {len(rows)})</p>
+      {pager_html}
       {error_html}
       <table>
         <thead>
