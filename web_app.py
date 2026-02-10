@@ -44,6 +44,7 @@ DEFAULT_PROFILE_SETTINGS: dict[str, object] = {
 _profile_settings_table_ready = False
 _review_status_table_ready = False
 _profile_presets_table_ready = False
+_last_bulk_action_cache: dict[str, dict[str, object]] = {}
 
 
 def _normalize_user_profile(raw_value: str | None) -> str:
@@ -328,15 +329,15 @@ def fetch_profile_presets(settings_obj: Settings, profile: str) -> list[dict[str
     _ensure_profile_presets_table(settings_obj)
     normalized_profile = _normalize_user_profile(profile)
     conn = _connect_db(settings_obj)
-    rows: list[tuple[object, object, object]] = []
+    rows: list[tuple[object, object, object, object]] = []
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT preset_name, rule_json, is_enabled
+                SELECT preset_name, rule_json, is_enabled, updated_at
                 FROM user_profile_preset
                 WHERE profile_key = %s
-                ORDER BY preset_name
+                ORDER BY is_enabled DESC, updated_at DESC, preset_name
                 """,
                 (normalized_profile,),
             )
@@ -345,13 +346,14 @@ def fetch_profile_presets(settings_obj: Settings, profile: str) -> list[dict[str
         conn.close()
 
     presets: list[dict[str, object]] = []
-    for preset_name, rule_json, is_enabled in rows:
+    for preset_name, rule_json, is_enabled, updated_at in rows:
         rule = _sanitize_profile_settings(rule_json if isinstance(rule_json, dict) else {})
         presets.append(
             {
                 "preset_name": str(preset_name),
                 "rule": rule,
                 "is_enabled": bool(is_enabled),
+                "updated_at": format_last_modified(updated_at),
             }
         )
     return presets
@@ -429,6 +431,70 @@ def delete_profile_preset(settings_obj: Settings, profile: str, preset_name: str
                       AND preset_name = %s
                     """,
                     (normalized_profile, preset_name.strip()),
+                )
+    finally:
+        conn.close()
+
+
+def rename_profile_preset(
+    settings_obj: Settings,
+    profile: str,
+    old_name: str,
+    new_name: str,
+) -> None:
+    _ensure_profile_presets_table(settings_obj)
+    normalized_profile = _normalize_user_profile(profile)
+    old_value = old_name.strip()
+    new_value = new_name.strip()
+    if not old_value or not new_value:
+        raise ValueError("preset name is required")
+    conn = _connect_db(settings_obj)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE user_profile_preset
+                    SET preset_name = %s, updated_at = now()
+                    WHERE profile_key = %s
+                      AND preset_name = %s
+                    """,
+                    (new_value, normalized_profile, old_value),
+                )
+    finally:
+        conn.close()
+
+
+def duplicate_profile_preset(
+    settings_obj: Settings,
+    profile: str,
+    source_name: str,
+    target_name: str,
+) -> None:
+    _ensure_profile_presets_table(settings_obj)
+    normalized_profile = _normalize_user_profile(profile)
+    src = source_name.strip()
+    tgt = target_name.strip()
+    if not src or not tgt:
+        raise ValueError("preset name is required")
+    conn = _connect_db(settings_obj)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO user_profile_preset (profile_key, preset_name, rule_json, is_enabled, updated_at)
+                    SELECT profile_key, %s, rule_json, is_enabled, now()
+                    FROM user_profile_preset
+                    WHERE profile_key = %s
+                      AND preset_name = %s
+                    ON CONFLICT (profile_key, preset_name)
+                    DO UPDATE SET
+                      rule_json = EXCLUDED.rule_json,
+                      is_enabled = EXCLUDED.is_enabled,
+                      updated_at = now()
+                    """,
+                    (tgt, normalized_profile, src),
                 )
     finally:
         conn.close()
@@ -519,6 +585,51 @@ def fetch_cpe_autocomplete_suggestions(
         "products": products,
         "versions": versions,
     }
+
+
+def fetch_cpe_preview_rows(
+    settings_obj: Settings,
+    vendor_value: str,
+    product_value: str,
+    version_value: str,
+    limit: int = 12,
+) -> list[dict[str, str]]:
+    vendor_key = vendor_value.strip().lower()
+    product_key = product_value.strip().lower()
+    version_key = version_value.strip().lower()
+    max_rows = max(1, min(int(limit), 20))
+    where_clauses = ["cc.vulnerable = TRUE"]
+    params: list[object] = []
+    if vendor_key:
+        where_clauses.append("cc.vendor ILIKE %s")
+        params.append(f"{vendor_key}%")
+    if product_key:
+        where_clauses.append("cc.product ILIKE %s")
+        params.append(f"{product_key}%")
+    if version_key:
+        where_clauses.append("COALESCE(cc.version, '') ILIKE %s")
+        params.append(f"{version_key}%")
+
+    conn = _connect_db(settings_obj)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT DISTINCT cc.vendor, cc.product, COALESCE(NULLIF(cc.version, ''), '-') AS version
+                FROM cve_cpe AS cc
+                WHERE {' AND '.join(where_clauses)}
+                ORDER BY cc.vendor, cc.product, version
+                LIMIT %s
+                """,
+                [*params, max_rows],
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [
+        {"vendor": str(vendor), "product": str(product), "version": str(version)}
+        for vendor, product, version in rows
+    ]
 
 
 def _build_count_cache_key(
@@ -654,16 +765,15 @@ def format_last_modified(value: object) -> str:
         base = value.strftime("%Y-%m-%d %H:%M:%S")
         offset = value.utcoffset()
         if offset is None:
-            return f"{base} UTC"
+            return base
         total_minutes = int(offset.total_seconds() // 60)
+        if total_minutes == 0:
+            return base
         sign = "+" if total_minutes >= 0 else "-"
         abs_minutes = abs(total_minutes)
         hours = abs_minutes // 60
         minutes = abs_minutes % 60
-        if hours == 0 and minutes == 0:
-            tz_text = "UTC+00"
-        else:
-            tz_text = f"UTC{sign}{hours:02d}:{minutes:02d}"
+        tz_text = f"UTC{sign}{hours:02d}:{minutes:02d}"
         return f"{base} {tz_text}"
     return str(value)
 
@@ -982,6 +1092,32 @@ def settings_page() -> str | object:
                     preview_notice = f"프리셋 '{preset_name}' 삭제 완료"
                 except Exception as exc:  # pragma: no cover
                     save_error = f"프리셋 삭제 실패: {exc}"
+        elif action == "rename_preset":
+            preset_name = (request.form.get("preset_name") or "").strip()
+            rename_to = (request.form.get("rename_to") or "").strip()
+            if app_settings is None:
+                save_error = "DB 연결 정보를 불러올 수 없어 프리셋 이름을 변경할 수 없습니다."
+            elif not rename_to:
+                save_error = "변경할 프리셋 이름을 입력하세요."
+            else:
+                try:
+                    rename_profile_preset(app_settings, user_profile, preset_name, rename_to)
+                    preview_notice = f"프리셋 '{preset_name}' 이름 변경 완료"
+                except Exception as exc:  # pragma: no cover
+                    save_error = f"프리셋 이름 변경 실패: {exc}"
+        elif action == "duplicate_preset":
+            preset_name = (request.form.get("preset_name") or "").strip()
+            duplicate_to = (request.form.get("duplicate_to") or "").strip()
+            if app_settings is None:
+                save_error = "DB 연결 정보를 불러올 수 없어 프리셋을 복제할 수 없습니다."
+            elif not duplicate_to:
+                save_error = "복제 대상 프리셋 이름을 입력하세요."
+            else:
+                try:
+                    duplicate_profile_preset(app_settings, user_profile, preset_name, duplicate_to)
+                    preview_notice = f"프리셋 '{preset_name}' 복제 완료"
+                except Exception as exc:  # pragma: no cover
+                    save_error = f"프리셋 복제 실패: {exc}"
 
         payload = {
             "vendor": (request.form.get("vendor") or "").strip(),
@@ -1061,19 +1197,34 @@ def settings_page() -> str | object:
         (
             "<tr>"
             f"<td>{escape(str(item['preset_name']))}</td>"
-            f"<td>{'ON' if item['is_enabled'] else 'OFF'}</td>"
+            f"<td><span class='preset-status {'on' if item['is_enabled'] else 'off'}'>{'ON' if item['is_enabled'] else 'OFF'}</span></td>"
             f"<td>{escape(str(item['rule'].get('vendor') or '-'))}</td>"
             f"<td>{escape(str(item['rule'].get('product') or '-'))}</td>"
             f"<td>{len(item['rule'].get('cpe_objects_catalog', []))}</td>"
+            f"<td>{escape(str(item.get('updated_at', '-')))}</td>"
             "<td>"
-            "<form method='post' style='display:inline-flex;gap:6px;align-items:center;'>"
+            "<form method='post' class='preset-action-inline'>"
             f"<input type='hidden' name='user_profile' value='{escape(user_profile)}'>"
             "<input type='hidden' name='action' value='toggle_preset'>"
             f"<input type='hidden' name='preset_name' value='{escape(str(item['preset_name']))}'>"
             f"<input type='hidden' name='preset_enabled' value='{'0' if item['is_enabled'] else '1'}'>"
-            f"<button class='btn {'preset-disable-btn' if item['is_enabled'] else 'preset-enable-btn'}' type='submit'>{'비활성화' if item['is_enabled'] else '활성화'}</button>"
+            f"<button class='btn preset-toggle-btn {'preset-disable-btn' if item['is_enabled'] else 'preset-enable-btn'}' type='submit'>{'비활성화' if item['is_enabled'] else '활성화'}</button>"
             "</form>"
-            "<form method='post' style='display:inline-flex;margin-left:6px;'>"
+            "<form method='post' class='preset-action-inline'>"
+            f"<input type='hidden' name='user_profile' value='{escape(user_profile)}'>"
+            "<input type='hidden' name='action' value='rename_preset'>"
+            f"<input type='hidden' name='preset_name' value='{escape(str(item['preset_name']))}'>"
+            "<input class='preset-mini-input' name='rename_to' placeholder='새 이름'>"
+            "<button class='btn ghost' type='submit'>이름변경</button>"
+            "</form>"
+            "<form method='post' class='preset-action-inline'>"
+            f"<input type='hidden' name='user_profile' value='{escape(user_profile)}'>"
+            "<input type='hidden' name='action' value='duplicate_preset'>"
+            f"<input type='hidden' name='preset_name' value='{escape(str(item['preset_name']))}'>"
+            "<input class='preset-mini-input' name='duplicate_to' placeholder='복제 이름'>"
+            "<button class='btn ghost' type='submit'>복제</button>"
+            "</form>"
+            "<form method='post' class='preset-action-inline'>"
             f"<input type='hidden' name='user_profile' value='{escape(user_profile)}'>"
             "<input type='hidden' name='action' value='delete_preset'>"
             f"<input type='hidden' name='preset_name' value='{escape(str(item['preset_name']))}'>"
@@ -1085,7 +1236,7 @@ def settings_page() -> str | object:
         for item in presets
     )
     if not preset_rows_html:
-        preset_rows_html = "<tr><td colspan='6'>등록된 프리셋 없음</td></tr>"
+        preset_rows_html = "<tr><td colspan='7'>등록된 프리셋 없음</td></tr>"
     return f"""
 <!doctype html>
 <html lang="ko">
@@ -1233,6 +1384,43 @@ def settings_page() -> str | object:
       width: 180px;
       min-width: 160px;
     }}
+    .preset-mini-input {{
+      width: 120px;
+      min-width: 110px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font: inherit;
+      background: #fff;
+    }}
+    .preset-action-inline {{
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      margin-right: 6px;
+      margin-bottom: 6px;
+    }}
+    .preset-status {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 46px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 8px;
+    }}
+    .preset-status.on {{
+      background: #e7f6ef;
+      color: #0e6a4c;
+      border-color: #9ecfb9;
+    }}
+    .preset-status.off {{
+      background: #fff0ea;
+      color: #8d3a21;
+      border-color: #efb8a3;
+    }}
     .btn {{
       text-decoration: none;
       border: 1px solid var(--line);
@@ -1259,6 +1447,10 @@ def settings_page() -> str | object:
       background: #e7f6ef;
       border-color: #9ecfb9;
       color: #0e6a4c;
+    }}
+    .preset-toggle-btn {{
+      min-width: 88px;
+      text-align: center;
     }}
     .preset-disable-btn {{
       background: #fff0ea;
@@ -1338,6 +1530,13 @@ def settings_page() -> str | object:
             <input id="cpe_version" list="cpe_version_suggestions" placeholder="version (optional)">
             <button class="btn" type="button" id="add-cpe-btn">추가</button>
           </div>
+          <p id="cpe-input-hint" style="margin:6px 0 0;font-size:12px;color:#5e6c73;">입력 형식: vendor + product는 필수, version은 선택입니다.</p>
+          <div id="cpe-preview-grid" style="margin-top:8px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff;">
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;background:#f6f8f7;font-size:12px;font-weight:700;color:#4c5a60;padding:8px 10px;">
+              <span>Vendor</span><span>Product</span><span>Version</span>
+            </div>
+            <div id="cpe-preview-rows" style="font-size:12px;color:#2f3f45;padding:8px 10px;">추천 결과 없음</div>
+          </div>
           <datalist id="cpe_vendor_suggestions"></datalist>
           <datalist id="cpe_product_suggestions"></datalist>
           <datalist id="cpe_version_suggestions"></datalist>
@@ -1400,6 +1599,7 @@ def settings_page() -> str | object:
               <th style="text-align:left;border-top:1px solid var(--line);padding:8px;">Vendor</th>
               <th style="text-align:left;border-top:1px solid var(--line);padding:8px;">Product</th>
               <th style="text-align:left;border-top:1px solid var(--line);padding:8px;">CPE 수</th>
+              <th style="text-align:left;border-top:1px solid var(--line);padding:8px;">수정시각</th>
               <th style="text-align:left;border-top:1px solid var(--line);padding:8px;">관리</th>
             </tr>
           </thead>
@@ -1422,9 +1622,13 @@ def settings_page() -> str | object:
     const vendorList = document.querySelector("#cpe_vendor_suggestions");
     const productList = document.querySelector("#cpe_product_suggestions");
     const versionList = document.querySelector("#cpe_version_suggestions");
+    const inputHint = document.querySelector("#cpe-input-hint");
+    const previewRows = document.querySelector("#cpe-preview-rows");
     let catalog = {cpe_catalog_json};
     let suggestTimer = null;
     let suggestAbortController = null;
+    let previewTimer = null;
+    let previewAbortController = null;
 
     const normalize = (value) => (value || "").trim().toLowerCase();
     const setDataList = (target, items) => {{
@@ -1474,6 +1678,53 @@ def settings_page() -> str | object:
       }}
       suggestTimer = setTimeout(fetchSuggest, 220);
     }};
+    const renderPreviewRows = (rows) => {{
+      if (!previewRows) return;
+      if (!rows || !rows.length) {{
+        previewRows.textContent = "추천 결과 없음";
+        return;
+      }}
+      previewRows.innerHTML = rows.map((row) => {{
+        const vendor = row?.vendor || "-";
+        const product = row?.product || "-";
+        const version = row?.version || "-";
+        return `<div style="display:grid;grid-template-columns:1fr 1fr 1fr;padding:4px 0;border-top:1px dashed #e2e6e4;"><span>${{vendor}}</span><span>${{product}}</span><span>${{version}}</span></div>`;
+      }}).join("");
+    }};
+    const fetchPreview = async () => {{
+      const vendor = normalize(vendorInput?.value);
+      const product = normalize(productInput?.value);
+      const version = normalize(versionInput?.value);
+      if (previewAbortController) {{
+        previewAbortController.abort();
+      }}
+      previewAbortController = new AbortController();
+      const params = new URLSearchParams();
+      if (vendor) params.set("vendor", vendor);
+      if (product) params.set("product", product);
+      if (version) params.set("version", version);
+      params.set("limit", "10");
+      try {{
+        const response = await fetch("/api/cpe/preview?" + params.toString(), {{
+          method: "GET",
+          signal: previewAbortController.signal,
+          headers: {{ "Accept": "application/json" }},
+        }});
+        if (!response.ok) {{
+          return;
+        }}
+        const data = await response.json();
+        renderPreviewRows(data?.rows || []);
+      }} catch (_) {{
+        // Ignore aborted or transient preview errors.
+      }}
+    }};
+    const queuePreview = () => {{
+      if (previewTimer) {{
+        clearTimeout(previewTimer);
+      }}
+      previewTimer = setTimeout(fetchPreview, 260);
+    }};
     const rebuildHidden = () => {{
       if (hiddenInput) {{
         hiddenInput.value = catalog.join("\\n");
@@ -1505,7 +1756,15 @@ def settings_page() -> str | object:
       const product = normalize(productInput?.value);
       const version = normalize(versionInput?.value);
       if (!vendor || !product) {{
+        if (inputHint) {{
+          inputHint.textContent = "vendor와 product를 모두 입력해야 추가됩니다.";
+          inputHint.style.color = "#ad3427";
+        }}
         return;
+      }}
+      if (inputHint) {{
+        inputHint.textContent = "입력 형식: vendor + product는 필수, version은 선택입니다.";
+        inputHint.style.color = "#5e6c73";
       }}
       const cpe = version ? `${{vendor}}:${{product}}:${{version}}` : `${{vendor}}:${{product}}`;
       if (!catalog.includes(cpe)) {{
@@ -1519,11 +1778,18 @@ def settings_page() -> str | object:
     vendorInput?.addEventListener("input", queueSuggest);
     productInput?.addEventListener("input", queueSuggest);
     versionInput?.addEventListener("input", queueSuggest);
+    vendorInput?.addEventListener("input", queuePreview);
+    productInput?.addEventListener("input", queuePreview);
+    versionInput?.addEventListener("input", queuePreview);
     vendorInput?.addEventListener("focus", queueSuggest);
     productInput?.addEventListener("focus", queueSuggest);
     versionInput?.addEventListener("focus", queueSuggest);
+    vendorInput?.addEventListener("focus", queuePreview);
+    productInput?.addEventListener("focus", queuePreview);
+    versionInput?.addEventListener("focus", queuePreview);
 
     render();
+    fetchPreview();
   }})();
 </script>
 </html>
@@ -1547,6 +1813,25 @@ def api_cpe_suggest() -> object:
         return jsonify(data)
     except Exception as exc:  # pragma: no cover
         return jsonify({"vendors": [], "products": [], "versions": [], "error": str(exc)}), 500
+
+
+@app.get("/api/cpe/preview")
+def api_cpe_preview() -> object:
+    vendor = (request.args.get("vendor") or "").strip()
+    product = (request.args.get("product") or "").strip()
+    version = (request.args.get("version") or "").strip()
+    limit_raw = (request.args.get("limit") or "10").strip()
+    try:
+        limit = int(limit_raw)
+    except ValueError:
+        limit = 10
+    limit = max(1, min(limit, 20))
+    try:
+        settings_obj = load_settings(".env")
+        rows = fetch_cpe_preview_rows(settings_obj, vendor, product, version, limit=limit)
+        return jsonify({"rows": rows})
+    except Exception as exc:  # pragma: no cover
+        return jsonify({"rows": [], "error": str(exc)}), 500
 
 
 @app.get("/")
@@ -1750,13 +2035,12 @@ def index() -> str:
             f"<td class='score'><span class='cvss-chip {escape(score_class)}'>{score_text}</span></td>"
             f"<td class='lastmod'>{last_modified}</td>"
             f"<td class='vtype'>{vuln_type}</td>"
-            "<td class='desc'>"
-            f"<details><summary>{summary}</summary><div class='detail-body'>{full_description}</div></details>"
-            "</td>"
+            f"<td class='desc'>{summary}</td>"
             f"<td class='cpe'><div class='cpe-wrap'>{cpe_badges}</div></td>"
             "<td class='actions'>"
             f"<button type='button' class='copy-btn' data-copy='{cve_id}'>Copy CVE</button>"
             f"<button type='button' class='copy-btn alt' data-copy='{cpe_for_copy}'>Copy CPE</button>"
+            f"<button type='button' class='copy-btn view-btn' data-cve='{cve_id}' data-desc='{full_description}'>View</button>"
             "</td>"
             "</tr>"
         )
@@ -2392,32 +2676,66 @@ def index() -> str:
     }}
     .copy-btn:hover {{ filter: brightness(0.98); }}
     .desc {{
-      position: relative;
-      overflow: visible;
+      color: #334b53;
+      font-weight: 500;
     }}
-    .desc details {{ cursor: pointer; position: relative; overflow: visible; }}
-    .desc summary {{ color: #334b53; font-weight: 500; }}
-    .desc summary:hover {{ color: #0f6f65; }}
-    .desc details[open] summary {{
-      color: #0c645b;
+    .view-btn {{
+      background: #f7f2ff;
+      border-color: #d2c2ee;
+      color: #49356a;
     }}
-    .detail-body {{
-      position: absolute;
-      top: calc(100% + 8px);
-      left: 0;
-      z-index: 80;
-      margin-top: 0;
-      padding: 10px;
-      border-radius: 8px;
-      border: 1px solid var(--line);
-      background: #fff;
-      line-height: 1.5;
-      width: min(920px, 82vw);
-      min-width: 520px;
-      max-width: 100%;
-      max-height: 420px;
+    .desc-drawer {{
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: min(720px, 94vw);
+      height: 100vh;
+      background: #fffdf8;
+      border-left: 1px solid var(--line);
+      box-shadow: -10px 0 24px rgba(26, 36, 42, 0.18);
+      z-index: 300;
+      transform: translateX(102%);
+      transition: transform 170ms ease;
+      display: flex;
+      flex-direction: column;
+    }}
+    .desc-drawer.open {{
+      transform: translateX(0);
+    }}
+    .desc-drawer-header {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: #f7faf8;
+    }}
+    .desc-drawer-title {{
+      margin: 0;
+      font-size: 15px;
+      font-weight: 700;
+      color: #1f343b;
+    }}
+    .desc-drawer-body {{
+      padding: 14px 16px;
       overflow: auto;
-      box-shadow: 0 10px 22px rgba(30, 43, 49, 0.12);
+      line-height: 1.55;
+      white-space: pre-wrap;
+      color: #2f3f45;
+      font-size: 14px;
+    }}
+    .desc-drawer-close {{
+      width: auto;
+      min-height: 34px;
+      border: 1px solid #ced9d5;
+      border-radius: 8px;
+      padding: 6px 10px;
+      background: #fff;
+      color: #254149;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
     }}
     .cpe-wrap {{
       display: flex;
@@ -2599,6 +2917,13 @@ def index() -> str:
       </table>
     </section>
   </main>
+  <aside id="desc-drawer" class="desc-drawer" aria-hidden="true">
+    <div class="desc-drawer-header">
+      <h3 id="desc-drawer-title" class="desc-drawer-title">Description</h3>
+      <button id="desc-drawer-close" type="button" class="desc-drawer-close">닫기</button>
+    </div>
+    <div id="desc-drawer-body" class="desc-drawer-body"></div>
+  </aside>
   <dialog id="export-dialog" class="export-dialog">
     <form method="dialog" class="export-dialog-body">
       <h3>엑셀 내보내기 범위 선택</h3>
@@ -2621,6 +2946,10 @@ def index() -> str:
     const lastModifiedStartDateInput = document.querySelector("#last_modified_start_date");
     const lastModifiedEndDateInput = document.querySelector("#last_modified_end_date");
     const copyButtons = document.querySelectorAll(".copy-btn");
+    const descDrawer = document.querySelector("#desc-drawer");
+    const descDrawerBody = document.querySelector("#desc-drawer-body");
+    const descDrawerTitle = document.querySelector("#desc-drawer-title");
+    const descDrawerClose = document.querySelector("#desc-drawer-close");
 
     const syncLastModifiedDateRange = () => {{
       if (!lastModifiedStartDateInput || !lastModifiedEndDateInput) {{
@@ -2731,6 +3060,17 @@ def index() -> str:
 
     copyButtons.forEach((btn) => {{
       btn.addEventListener("click", async () => {{
+        if (btn.classList.contains("view-btn")) {{
+          const cve = btn.dataset.cve || "CVE";
+          const desc = btn.dataset.desc || "";
+          if (descDrawer && descDrawerBody && descDrawerTitle) {{
+            descDrawerTitle.textContent = cve;
+            descDrawerBody.textContent = desc;
+            descDrawer.classList.add("open");
+            descDrawer.setAttribute("aria-hidden", "false");
+          }}
+          return;
+        }}
         const text = btn.dataset.copy || "";
         try {{
           await navigator.clipboard.writeText(text);
@@ -2741,6 +3081,17 @@ def index() -> str:
           window.prompt("Copy value:", text);
         }}
       }});
+    }});
+    descDrawerClose?.addEventListener("click", () => {{
+      if (!descDrawer) return;
+      descDrawer.classList.remove("open");
+      descDrawer.setAttribute("aria-hidden", "true");
+    }});
+    document.addEventListener("keydown", (event) => {{
+      if (event.key === "Escape" && descDrawer?.classList.contains("open")) {{
+        descDrawer.classList.remove("open");
+        descDrawer.setAttribute("aria-hidden", "true");
+      }}
     }});
   }})();
 </script>
@@ -2754,7 +3105,8 @@ def daily_review() -> str | object:
     app_settings: Settings | None = None
     profile_defaults = dict(DEFAULT_PROFILE_SETTINGS)
     error_text = ""
-    notice_text = ""
+    notice_text = (request.args.get("notice") or "").strip()
+    highlight_cve_id = (request.args.get("highlight_cve") or "").strip()
     try:
         app_settings = load_settings(".env")
         profile_defaults = fetch_profile_settings(app_settings, user_profile)
@@ -2799,6 +3151,13 @@ def daily_review() -> str | object:
 
     if request.method == "POST" and not error_text:
         action = (request.form.get("action") or "row_update").strip().lower()
+        redirect_query = {
+            "user_profile": user_profile,
+            "period_mode": period_mode,
+            "window_days": str(window_days),
+            "review_limit": str(review_limit),
+            "status_filter": status_filter,
+        }
         if action == "bulk_update":
             selected_cve_ids = [value.strip() for value in request.form.getlist("selected_cve_id") if value.strip()]
             bulk_status = (request.form.get("bulk_status") or "pending").strip().lower()
@@ -2807,11 +3166,44 @@ def daily_review() -> str | object:
                 error_text = "일괄 변경할 CVE를 선택하세요."
             else:
                 try:
+                    previous_state = fetch_daily_review_map(app_settings, user_profile, review_date)
+                    _last_bulk_action_cache[f"{user_profile}:{review_date}"] = {
+                        "items": [
+                            {
+                                "cve_id": cve_id,
+                                "status": previous_state.get(cve_id, {}).get("status", "pending"),
+                                "note": previous_state.get(cve_id, {}).get("note", ""),
+                            }
+                            for cve_id in selected_cve_ids
+                        ]
+                    }
                     for cve_id in selected_cve_ids:
                         upsert_daily_review_item(app_settings, user_profile, review_date, cve_id, bulk_status, bulk_note)
-                    notice_text = f"{len(selected_cve_ids)}건 상태가 일괄 저장되었습니다."
+                    redirect_query["notice"] = f"{len(selected_cve_ids)}건 상태가 일괄 저장되었습니다."
+                    return redirect("/daily?" + urlencode(redirect_query))
                 except Exception as exc:  # pragma: no cover
                     error_text = f"일괄 상태 저장 실패: {exc}"
+        elif action == "undo_bulk":
+            last_bulk = _last_bulk_action_cache.get(f"{user_profile}:{review_date}", {})
+            items = list(last_bulk.get("items", []))
+            if not items:
+                error_text = "되돌릴 최근 일괄 변경이 없습니다."
+            else:
+                try:
+                    for item in items:
+                        upsert_daily_review_item(
+                            app_settings,
+                            user_profile,
+                            review_date,
+                            str(item.get("cve_id", "")),
+                            str(item.get("status", "pending")),
+                            str(item.get("note", "")),
+                        )
+                    _last_bulk_action_cache.pop(f"{user_profile}:{review_date}", None)
+                    redirect_query["notice"] = f"{len(items)}건 일괄 변경을 되돌렸습니다."
+                    return redirect("/daily?" + urlencode(redirect_query))
+                except Exception as exc:  # pragma: no cover
+                    error_text = f"일괄 상태 되돌리기 실패: {exc}"
         else:
             cve_id = (request.form.get("cve_id") or "").strip()
             status = (request.form.get("status") or "pending").strip().lower()
@@ -2821,7 +3213,9 @@ def daily_review() -> str | object:
             else:
                 try:
                     upsert_daily_review_item(app_settings, user_profile, review_date, cve_id, status, note)
-                    notice_text = f"{cve_id} 상태가 저장되었습니다."
+                    redirect_query["notice"] = f"{cve_id} 상태가 저장되었습니다."
+                    redirect_query["highlight_cve"] = cve_id
+                    return redirect("/daily?" + urlencode(redirect_query))
                 except Exception as exc:  # pragma: no cover
                     error_text = f"상태 저장 실패: {exc}"
 
@@ -2910,16 +3304,25 @@ def daily_review() -> str | object:
         filtered_count += 1
         current_note = escape(state.get("note", ""))
         score_label, score_class = format_cvss_badge(row.get("cvss_score"))
+        status_badge_class = "review-badge pending"
+        status_badge_text = "미검토"
+        if current_status == "reviewed":
+            status_badge_class = "review-badge reviewed"
+            status_badge_text = "검토완료"
+        elif current_status == "ignored":
+            status_badge_class = "review-badge ignored"
+            status_badge_text = "제외"
         row_chunks.append(
             "<tr>"
-            f"<td><input type='checkbox' name='selected_cve_id' value='{cve_id}' form='bulk-form' class='bulk-cve-check'></td>"
+            f"<td class='sticky-col sticky-left'><input type='checkbox' name='selected_cve_id' value='{cve_id}' form='bulk-form' class='bulk-cve-check'></td>"
             f"<td class='id'>{cve_id}</td>"
             f"<td class='score'><span class='cvss-chip {escape(score_class)}'>{escape(score_label)}</span></td>"
             f"<td>{escape(str(row.get('vuln_type', 'Other')))}</td>"
             f"<td>{escape(format_last_modified(row.get('last_modified_at', 'N/A')))}</td>"
             f"<td>{escape(shorten(str(row.get('description', '')), 120))}</td>"
             f"<td>{escape(', '.join(matched_preset_map.get(cve_id_raw, [])) or '-')}</td>"
-            "<td>"
+            f"<td class='sticky-col sticky-right {'row-highlight' if cve_id_raw == highlight_cve_id else ''}'>"
+            f"<div class='{status_badge_class}'>{status_badge_text}</div>"
             "<form method='post' class='review-form'>"
             f"<input type='hidden' name='user_profile' value='{escape(user_profile)}'>"
             f"<input type='hidden' name='period_mode' value='{escape(period_mode)}'>"
@@ -2950,6 +3353,15 @@ def daily_review() -> str | object:
         f"현재 표시 필터: {status_filter} (표시 {filtered_count}건)",
         f"활성 프리셋: {', '.join(item['preset_name'] for item in active_presets) if active_presets else '없음(프로필 기본 규칙 사용)'}",
     ]
+    has_undo_bulk = bool(_last_bulk_action_cache.get(f"{user_profile}:{review_date}", {}).get("items"))
+    quick_status_links = "".join(
+        f"<a class='quick-chip {'active' if status_filter == key else ''}' href='/daily?{urlencode({'user_profile': user_profile, 'period_mode': period_mode, 'window_days': str(window_days), 'review_limit': str(review_limit), 'status_filter': key})}'>{label}</a>"
+        for key, label in [("pending", "미검토"), ("reviewed", "검토완료"), ("ignored", "제외"), ("all", "전체")]
+    )
+    quick_period_links = "".join(
+        f"<a class='quick-chip {'active' if period_mode == key else ''}' href='/daily?{urlencode({'user_profile': user_profile, 'period_mode': key, 'window_days': str(window_days), 'review_limit': str(review_limit), 'status_filter': status_filter})}'>{label}</a>"
+        for key, label in [("previous_day", "전일 마감"), ("last24h", "최근 24h")]
+    )
     daily_export_href = (
         "/daily_export.xlsx?"
         + urlencode(
@@ -3008,6 +3420,27 @@ def daily_review() -> str | object:
       justify-content: center;
       min-height: 38px;
     }}
+    .quick-filters {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 0 0 10px;
+    }}
+    .quick-chip {{
+      text-decoration: none;
+      border: 1px solid #ccd6d3;
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #28444c;
+      background: #fff;
+    }}
+    .quick-chip.active {{
+      color: #fff;
+      background: var(--accent-2);
+      border-color: var(--accent-2);
+    }}
     .bulk-toolbar {{ margin: 0 0 10px; }}
     .meta {{ margin: 8px 0 10px; font-size: 13px; color: var(--muted); }}
     .ok-msg {{ color:#0c6d57; font-size:13px; font-weight:700; margin: 4px 0; }}
@@ -3025,6 +3458,37 @@ def daily_review() -> str | object:
     .cvss-medium {{ color:#7b6400; background:#fff8d8; border-color:#ead88a; }}
     .cvss-low {{ color:#4b4f55; background:#eef0f3; border-color:#d3d8de; }}
     .cvss-none {{ color:#8f98a3; background:#1b1f24; border-color:#2f3842; }}
+    .table-wrap {{ overflow: auto; border: 1px solid var(--line); border-radius: 10px; }}
+    .sticky-col {{
+      position: sticky;
+      background: #fffdf8;
+      z-index: 3;
+    }}
+    .sticky-left {{ left: 0; min-width: 42px; }}
+    .sticky-right {{ right: 0; min-width: 340px; box-shadow: -6px 0 8px rgba(20, 34, 40, 0.04); }}
+    .review-badge {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 72px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-size: 11px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }}
+    .review-badge.pending {{ background: #f1f3f5; color: #3f4950; border-color: #d4dade; }}
+    .review-badge.reviewed {{ background: #e7f6ef; color: #0e6a4c; border-color: #9ecfb9; }}
+    .review-badge.ignored {{ background: #fff0ea; color: #8d3a21; border-color: #efb8a3; }}
+    .row-highlight {{
+      animation: rowGlow 1.2s ease-out;
+      box-shadow: inset 0 0 0 2px rgba(15, 111, 101, 0.22);
+    }}
+    @keyframes rowGlow {{
+      0% {{ background: #e9f8f3; }}
+      100% {{ background: #fffdf8; }}
+    }}
   </style>
 </head>
 <body>
@@ -3065,8 +3529,13 @@ def daily_review() -> str | object:
         <a class="toolbar-link" href="{escape(daily_export_href)}">엑셀 다운로드</a>
         <button type="submit">새로고침</button>
       </form>
+      <div class="quick-filters">
+        {quick_period_links}
+      </div>
+      <div class="quick-filters">
+        {quick_status_links}
+      </div>
       <form id="bulk-form" method="post" class="toolbar bulk-toolbar">
-        <input type="hidden" name="action" value="bulk_update">
         <input type="hidden" name="user_profile" value="{escape(user_profile)}">
         <input type="hidden" name="period_mode" value="{escape(period_mode)}">
         <input type="hidden" name="window_days" value="{window_days}">
@@ -3084,21 +3553,24 @@ def daily_review() -> str | object:
           <label for="bulk_note">일괄 메모(선택)</label>
           <input id="bulk_note" name="bulk_note" placeholder="선택된 CVE에 동일 메모 저장">
         </div>
-        <button type="submit">선택 항목 일괄 저장</button>
+        <button type="submit" name="action" value="bulk_update">선택 항목 일괄 저장</button>
+        <button type="submit" name="action" value="undo_bulk" {'disabled' if not has_undo_bulk else ''}>최근 일괄 변경 되돌리기</button>
       </form>
       {notice_html}
       {error_html}
       <p class="meta">대상 {total_count}건 (표시 {filtered_count}건) | {' | '.join(escape(line) for line in info_lines)}</p>
+      <div class="table-wrap">
       <table>
         <thead>
           <tr>
-            <th><input id="bulk-select-all" type="checkbox" title="전체 선택"></th><th>CVE ID</th><th>CVSS</th><th>Type</th><th>Last Modified</th><th>Description</th><th>Preset</th><th>Review</th>
+            <th class="sticky-col sticky-left"><input id="bulk-select-all" type="checkbox" title="전체 선택"></th><th>CVE ID</th><th>CVSS</th><th>Type</th><th>Last Modified</th><th>Description</th><th>Preset</th><th class="sticky-col sticky-right">Review</th>
           </tr>
         </thead>
         <tbody>
           {''.join(row_chunks)}
         </tbody>
       </table>
+      </div>
     </section>
   </main>
 </body>
@@ -3119,6 +3591,43 @@ def daily_review() -> str | object:
         selectAll.checked = all.every((x) => x.checked);
       }});
     }});
+    const bulkForm = document.querySelector("#bulk-form");
+    bulkForm?.addEventListener("submit", (event) => {{
+      const submitter = event.submitter;
+      if (!submitter || submitter.value !== "bulk_update") {{
+        return;
+      }}
+      const selected = checks().filter((x) => x.checked).length;
+      if (selected <= 0) {{
+        event.preventDefault();
+        window.alert("일괄 변경할 CVE를 선택하세요.");
+        return;
+      }}
+      const targetStatus = (document.querySelector("#bulk_status") || {{ value: "pending" }}).value;
+      const confirmed = window.confirm(`선택한 ${{selected}}건을 '${{targetStatus}}' 상태로 변경할까요?`);
+      if (!confirmed) {{
+        event.preventDefault();
+      }}
+    }});
+    if ({'true' if bool(notice_text) else 'false'}) {{
+      const toast = document.createElement("div");
+      toast.textContent = "{escape(notice_text)}";
+      toast.style.position = "fixed";
+      toast.style.right = "18px";
+      toast.style.bottom = "18px";
+      toast.style.padding = "10px 14px";
+      toast.style.border = "1px solid #9ecfb9";
+      toast.style.background = "#e7f6ef";
+      toast.style.color = "#0e6a4c";
+      toast.style.borderRadius = "10px";
+      toast.style.fontSize = "12px";
+      toast.style.fontWeight = "700";
+      toast.style.zIndex = "999";
+      document.body.appendChild(toast);
+      setTimeout(() => {{
+        toast.remove();
+      }}, 1500);
+    }}
   }})();
 </script>
 </html>
