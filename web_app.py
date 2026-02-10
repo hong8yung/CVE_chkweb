@@ -3520,7 +3520,6 @@ def daily_review() -> str | object:
                     cpe_objects=list(profile_defaults["cpe_objects_catalog"]) or None,
                     include_total_count=True,
                 )
-            sync_daily_review_backlog(app_settings, user_profile, rows)
             review_map = fetch_daily_review_backlog_map(
                 app_settings,
                 user_profile,
@@ -4290,7 +4289,6 @@ def daily_export_xlsx() -> object:
             include_total_count=False,
         )
 
-    sync_daily_review_backlog(settings_obj, user_profile, rows)
     review_map = fetch_daily_review_backlog_map(
         settings_obj,
         user_profile,
