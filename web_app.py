@@ -6,7 +6,7 @@ import math
 import re
 import time
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html import escape
 from urllib.parse import urlencode
 
@@ -27,6 +27,7 @@ COUNT_CACHE_MAX_ENTRIES = 200
 _count_cache: dict[str, tuple[int, float]] = {}
 VALID_USER_PROFILES = {"hq", "jaehwa"}
 VALID_SORT_KEYS = {"cvss_desc", "cvss_asc", "last_modified_desc", "last_modified_asc"}
+KST = timezone(timedelta(hours=9))
 DEFAULT_PROFILE_SETTINGS: dict[str, object] = {
     "vendor": "",
     "product": "",
@@ -776,6 +777,15 @@ def format_last_modified(value: object) -> str:
         tz_text = f"UTC{sign}{hours:02d}:{minutes:02d}"
         return f"{base} {tz_text}"
     return str(value)
+
+
+def format_checkpoint_kst(value: datetime | None) -> str:
+    if value is None:
+        return "기록 없음"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    local_value = value.astimezone(KST)
+    return f"{local_value.strftime('%Y-%m-%d %H:%M:%S')} KST"
 
 
 def _build_menu_html(active_page: str, user_profile: str | None = None) -> str:
@@ -1982,7 +1992,7 @@ def index() -> str:
         try:
             try:
                 checkpoint_value = fetch_incremental_checkpoint(app_settings)
-                checkpoint_text = format_last_modified(checkpoint_value) if checkpoint_value else "기록 없음"
+                checkpoint_text = format_checkpoint_kst(checkpoint_value)
             except Exception:
                 checkpoint_text = "조회 실패"
             rows, total_count = fetch_cves_from_db(
@@ -3119,7 +3129,7 @@ def daily_review() -> str | object:
         except Exception:
             active_presets = []
 
-    now_local = datetime.now().replace(second=0, microsecond=0)
+    now_utc = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     window_days_raw = request.values.get("window_days") or str(profile_defaults["daily_review_window_days"])
     try:
         window_days = max(1, min(int(window_days_raw), 30))
@@ -3139,15 +3149,16 @@ def daily_review() -> str | object:
         status_filter = "pending"
 
     if period_mode == "previous_day":
-        end_dt = now_local.replace(hour=0, minute=0)
-        start_dt = end_dt - timedelta(days=window_days)
-        review_date = (end_dt - timedelta(days=1)).date().isoformat()
-        period_label = f"{start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')}"
+        utc_midnight = now_utc.replace(hour=0, minute=0)
+        start_dt = utc_midnight - timedelta(days=window_days)
+        end_dt = now_utc
+        review_date = now_utc.date().isoformat()
+        period_label = f"{start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')} UTC"
     else:
-        end_dt = now_local
-        start_dt = now_local - timedelta(hours=24 * window_days)
+        end_dt = now_utc
+        start_dt = now_utc - timedelta(hours=24 * window_days)
         review_date = end_dt.date().isoformat()
-        period_label = f"{start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')}"
+        period_label = f"{start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')} UTC"
 
     if request.method == "POST" and not error_text:
         action = (request.form.get("action") or "row_update").strip().lower()
@@ -3319,7 +3330,8 @@ def daily_review() -> str | object:
             f"<td class='score'><span class='cvss-chip {escape(score_class)}'>{escape(score_label)}</span></td>"
             f"<td>{escape(str(row.get('vuln_type', 'Other')))}</td>"
             f"<td>{escape(format_last_modified(row.get('last_modified_at', 'N/A')))}</td>"
-            f"<td>{escape(shorten(str(row.get('description', '')), 120))}</td>"
+            f"<td>{escape(shorten(str(row.get('description', '')), 120))} "
+            f"<button type='button' class='view-btn' data-cve='{cve_id}' data-desc='{escape(str(row.get('description', '')))}'>View</button></td>"
             f"<td>{escape(', '.join(matched_preset_map.get(cve_id_raw, [])) or '-')}</td>"
             f"<td class='sticky-col sticky-right {'row-highlight' if cve_id_raw == highlight_cve_id else ''}'>"
             f"<div class='{status_badge_class}'>{status_badge_text}</div>"
@@ -3485,6 +3497,71 @@ def daily_review() -> str | object:
       animation: rowGlow 1.2s ease-out;
       box-shadow: inset 0 0 0 2px rgba(15, 111, 101, 0.22);
     }}
+    .view-btn {{
+      margin-left: 6px;
+      width: auto;
+      border: 1px solid #d2c2ee;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: #f7f2ff;
+      color: #49356a;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .desc-drawer {{
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: min(720px, 94vw);
+      height: 100vh;
+      background: #fffdf8;
+      border-left: 1px solid var(--line);
+      box-shadow: -10px 0 24px rgba(26, 36, 42, 0.18);
+      z-index: 300;
+      transform: translateX(102%);
+      transition: transform 170ms ease;
+      display: flex;
+      flex-direction: column;
+    }}
+    .desc-drawer.open {{
+      transform: translateX(0);
+    }}
+    .desc-drawer-header {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: #f7faf8;
+    }}
+    .desc-drawer-title {{
+      margin: 0;
+      font-size: 15px;
+      font-weight: 700;
+      color: #1f343b;
+    }}
+    .desc-drawer-body {{
+      padding: 14px 16px;
+      overflow: auto;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      color: #2f3f45;
+      font-size: 14px;
+    }}
+    .desc-drawer-close {{
+      width: auto;
+      min-height: 34px;
+      border: 1px solid #ced9d5;
+      border-radius: 8px;
+      padding: 6px 10px;
+      background: #fff;
+      color: #254149;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }}
     @keyframes rowGlow {{
       0% {{ background: #e9f8f3; }}
       100% {{ background: #fffdf8; }}
@@ -3573,11 +3650,23 @@ def daily_review() -> str | object:
       </div>
     </section>
   </main>
+  <aside id="daily-desc-drawer" class="desc-drawer" aria-hidden="true">
+    <div class="desc-drawer-header">
+      <h3 id="daily-desc-drawer-title" class="desc-drawer-title">Description</h3>
+      <button id="daily-desc-drawer-close" type="button" class="desc-drawer-close">닫기</button>
+    </div>
+    <div id="daily-desc-drawer-body" class="desc-drawer-body"></div>
+  </aside>
 </body>
 <script>
   (() => {{
     const selectAll = document.querySelector("#bulk-select-all");
     const checks = () => Array.from(document.querySelectorAll(".bulk-cve-check"));
+    const viewButtons = Array.from(document.querySelectorAll(".view-btn"));
+    const descDrawer = document.querySelector("#daily-desc-drawer");
+    const descDrawerBody = document.querySelector("#daily-desc-drawer-body");
+    const descDrawerTitle = document.querySelector("#daily-desc-drawer-title");
+    const descDrawerClose = document.querySelector("#daily-desc-drawer-close");
     selectAll?.addEventListener("change", () => {{
       const checked = !!selectAll.checked;
       checks().forEach((el) => {{
@@ -3628,6 +3717,30 @@ def daily_review() -> str | object:
         toast.remove();
       }}, 1500);
     }}
+    viewButtons.forEach((btn) => {{
+      btn.addEventListener("click", () => {{
+        const cve = btn.dataset.cve || "CVE";
+        const desc = btn.dataset.desc || "";
+        if (!descDrawer || !descDrawerBody || !descDrawerTitle) {{
+          return;
+        }}
+        descDrawerTitle.textContent = cve;
+        descDrawerBody.textContent = desc;
+        descDrawer.classList.add("open");
+        descDrawer.setAttribute("aria-hidden", "false");
+      }});
+    }});
+    descDrawerClose?.addEventListener("click", () => {{
+      if (!descDrawer) return;
+      descDrawer.classList.remove("open");
+      descDrawer.setAttribute("aria-hidden", "true");
+    }});
+    document.addEventListener("keydown", (event) => {{
+      if (event.key === "Escape" && descDrawer?.classList.contains("open")) {{
+        descDrawer.classList.remove("open");
+        descDrawer.setAttribute("aria-hidden", "true");
+      }}
+    }});
   }})();
 </script>
 </html>
@@ -3650,7 +3763,7 @@ def daily_export_xlsx() -> object:
     except Exception as exc:  # pragma: no cover
         return f"Failed to load settings: {exc}", 500
 
-    now_local = datetime.now().replace(second=0, microsecond=0)
+    now_utc = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     window_days_raw = request.args.get("window_days") or str(profile_defaults["daily_review_window_days"])
     try:
         window_days = max(1, min(int(window_days_raw), 30))
@@ -3663,12 +3776,13 @@ def daily_export_xlsx() -> object:
         review_limit = int(profile_defaults["daily_review_limit"])
 
     if period_mode == "previous_day":
-        end_dt = now_local.replace(hour=0, minute=0)
-        start_dt = end_dt - timedelta(days=window_days)
-        review_date = (end_dt - timedelta(days=1)).date().isoformat()
+        utc_midnight = now_utc.replace(hour=0, minute=0)
+        start_dt = utc_midnight - timedelta(days=window_days)
+        end_dt = now_utc
+        review_date = now_utc.date().isoformat()
     else:
-        end_dt = now_local
-        start_dt = now_local - timedelta(hours=24 * window_days)
+        end_dt = now_utc
+        start_dt = now_utc - timedelta(hours=24 * window_days)
         review_date = end_dt.date().isoformat()
 
     try:

@@ -108,10 +108,12 @@ python3 web_app.py --host 0.0.0.0 --port 8888
 일일 검토:
 - 프로필 저장 규칙(`vendor`, `product`, `keyword`, `Impact Type`, `CPE Object`, `min_cvss`) 기반으로 자동 조회
 - 기간 기준(`전일 마감`, `최근 24h`) + 기간(일) 선택 가능
+  - `전일 마감`은 `UTC 00:00 - 기간(일)`부터 `현재 UTC`까지 조회
 - 행별 검토 상태(`미검토/검토완료/제외`)와 메모 저장
 - 상태 필터(`전체/미검토/검토완료/제외`) 및 선택 항목 일괄 상태 변경 지원
 - 일괄 변경 전 확인 팝업 및 최근 일괄 변경 되돌리기(undo) 지원
 - 설정 페이지에서 만든 활성 프리셋들을 OR 합집합으로 조회
+- Description `View` 버튼으로 우측 드로어에서 상세 내용 확인 가능
 
 설정 페이지 CPE UX:
 - CPE 객체를 `vendor/product/version` 입력 후 추가
@@ -125,7 +127,7 @@ python3 web_app.py --host 0.0.0.0 --port 8888
 표시/동작:
 - `CVSS`는 등급+점수 칩으로 표시 (`None/Low/Medium/High/Critical`)
 - 정렬은 테이블 헤더 `CVSS`, `Last Modified` 클릭으로 토글
-- Description 상세는 오버레이로 표시(테이블 폭 고정)
+- Description 상세는 `View` 버튼으로 우측 드로어에서 표시
 - `Reset Filters`, `Share URL`, 행별 `Copy CVE`/`Copy CPE` 버튼 지원
 
 개발 중 재시작 스크립트:
