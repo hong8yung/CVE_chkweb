@@ -359,16 +359,20 @@ def index() -> str:
     product = (request.args.get("product") or "").strip()
     vendor = (request.args.get("vendor") or "").strip()
     keyword = (request.args.get("keyword") or "").strip()
+    user_supplied_last_modified = bool(request.args.get("last_modified_start") or request.args.get("last_modified_end"))
     last_modified_start_raw = (request.args.get("last_modified_start") or "").strip()
     last_modified_end_raw = (request.args.get("last_modified_end") or "").strip()
+    if not last_modified_start_raw and not last_modified_end_raw:
+        now_local = datetime.now().replace(second=0, microsecond=0)
+        last_modified_end_raw = now_local.isoformat(timespec="minutes")
+        last_modified_start_raw = (now_local - timedelta(days=7)).isoformat(timespec="minutes")
     cpe_missing_only = request.args.get("cpe_missing_only") == "1"
     selected_impacts = [value.strip() for value in request.args.getlist("impact_type") if value.strip()]
     no_filter_input = (
         not product
         and not vendor
         and not keyword
-        and not last_modified_start_raw
-        and not last_modified_end_raw
+        and not user_supplied_last_modified
         and not cpe_missing_only
         and not selected_impacts
     )
@@ -854,6 +858,55 @@ def index() -> str:
       white-space: nowrap;
     }}
     .secondary-btn:hover {{ background: #e8edeb; }}
+    .export-dialog {{
+      border: 1px solid #cfdad6;
+      border-radius: 14px;
+      padding: 0;
+      width: min(92vw, 420px);
+      box-shadow: 0 18px 42px rgba(18, 58, 68, 0.26);
+    }}
+    .export-dialog::backdrop {{
+      background: rgba(21, 40, 48, 0.42);
+      backdrop-filter: blur(2px);
+    }}
+    .export-dialog-body {{
+      padding: 18px;
+    }}
+    .export-dialog h3 {{
+      margin: 0 0 8px;
+      font-size: 17px;
+      color: #123a44;
+    }}
+    .export-dialog p {{
+      margin: 0;
+      color: #4b5f64;
+      font-size: 13px;
+      line-height: 1.45;
+    }}
+    .export-dialog-actions {{
+      margin-top: 16px;
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+    }}
+    .dialog-btn {{
+      width: auto;
+      min-height: 36px;
+      padding: 8px 11px;
+      font-size: 12px;
+      border-radius: 9px;
+    }}
+    .dialog-btn.page {{
+      background: #eef3f2;
+      color: #21464f;
+      border: 1px solid #c6d6d1;
+    }}
+    .dialog-btn.cancel {{
+      background: #f8f4f0;
+      color: #6e4f3d;
+      border: 1px solid #dfc9b8;
+    }}
     .meta {{
       margin: 0;
       padding: 12px 16px 4px;
@@ -1172,6 +1225,17 @@ def index() -> str:
       </table>
     </section>
   </main>
+  <dialog id="export-dialog" class="export-dialog">
+    <form method="dialog" class="export-dialog-body">
+      <h3>엑셀 내보내기 범위 선택</h3>
+      <p>현재 검색 조건 결과를 엑셀로 다운로드합니다. 전체 결과 또는 현재 페이지만 선택하세요.</p>
+      <div class="export-dialog-actions">
+        <button type="button" class="dialog-btn" data-export-scope="all">전체 결과</button>
+        <button type="button" class="dialog-btn page" data-export-scope="page">현재 페이지만</button>
+        <button type="button" class="dialog-btn cancel" data-export-scope="cancel">취소</button>
+      </div>
+    </form>
+  </dialog>
 </body>
 <script>
   (() => {{
@@ -1179,7 +1243,35 @@ def index() -> str:
     const impactDetails = document.querySelector(".impact-details");
     const shareButton = document.querySelector("#share-url-btn");
     const exportButton = document.querySelector("#export-xlsx-btn");
+    const exportDialog = document.querySelector("#export-dialog");
     const copyButtons = document.querySelectorAll(".copy-btn");
+
+    const openExportDialog = () => {{
+      if (!exportDialog || typeof exportDialog.showModal !== "function") {{
+        return Promise.resolve(window.confirm("전체 결과를 내보낼까요?\\n확인: 전체 결과\\n취소: 현재 페이지만") ? "all" : "page");
+      }}
+      return new Promise((resolve) => {{
+        const buttons = exportDialog.querySelectorAll("[data-export-scope]");
+        const onSelect = (event) => {{
+          const target = event.currentTarget;
+          const scope = target?.dataset?.exportScope || "cancel";
+          cleanup();
+          exportDialog.close();
+          resolve(scope);
+        }};
+        const onClose = () => {{
+          cleanup();
+          resolve("cancel");
+        }};
+        const cleanup = () => {{
+          buttons.forEach((btn) => btn.removeEventListener("click", onSelect));
+          exportDialog.removeEventListener("close", onClose);
+        }};
+        buttons.forEach((btn) => btn.addEventListener("click", onSelect));
+        exportDialog.addEventListener("close", onClose, {{ once: true }});
+        exportDialog.showModal();
+      }});
+    }};
 
     if (impactDetails) {{
       document.addEventListener("click", (event) => {{
@@ -1209,10 +1301,22 @@ def index() -> str:
     }}
 
     if (exportButton) {{
-      exportButton.addEventListener("click", () => {{
+      exportButton.addEventListener("click", async () => {{
+        const exportScope = await openExportDialog();
+        if (exportScope === "cancel") {{
+          return;
+        }}
         const params = new URLSearchParams(window.location.search);
-        const exportAll = window.confirm("Export all filtered results?\\nOK: All pages\\nCancel: Current page only");
-        params.set("export_scope", exportAll ? "all" : "page");
+        if (form) {{
+          const formData = new FormData(form);
+          for (const [key, value] of formData.entries()) {{
+            params.set(key, String(value));
+          }}
+          if (!formData.has("cpe_missing_only")) {{
+            params.delete("cpe_missing_only");
+          }}
+        }}
+        params.set("export_scope", exportScope);
         window.location.href = `/export.xlsx?${{params.toString()}}`;
       }});
     }}
