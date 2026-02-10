@@ -1211,7 +1211,7 @@ def index() -> str:
     if (exportButton) {{
       exportButton.addEventListener("click", () => {{
         const params = new URLSearchParams(window.location.search);
-        const exportAll = window.confirm("Export all filtered results?\nOK: All pages\nCancel: Current page only");
+        const exportAll = window.confirm("Export all filtered results?\\nOK: All pages\\nCancel: Current page only");
         params.set("export_scope", exportAll ? "all" : "page");
         window.location.href = `/export.xlsx?${{params.toString()}}`;
       }});
