@@ -113,7 +113,9 @@ python3 web_app.py --host 0.0.0.0 --port 8888
 - 상태 필터(`전체/미검토/검토완료/제외`) 및 선택 항목 일괄 상태 변경 지원
 - 일괄 변경 전 확인 팝업 및 최근 일괄 변경 되돌리기(undo) 지원
 - 설정 페이지에서 만든 활성 프리셋들을 OR 합집합으로 조회
-- Description `View` 버튼으로 우측 드로어에서 상세 내용 확인 가능
+- 테이블에 `CPE` 열이 표시되며, `Description`은 `View` 버튼으로 우측 드로어에서 상세 내용 확인 가능
+- 우측 드로어는 `닫기` 버튼, `Esc`, 드로어 외부 클릭으로 닫힘
+- `엑셀 다운로드(/daily_export.xlsx)` 결과에 `CPE` 컬럼 포함
 
 설정 페이지 CPE UX:
 - CPE 객체를 `vendor/product/version` 입력 후 추가
