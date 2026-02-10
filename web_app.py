@@ -1552,47 +1552,6 @@ def index() -> str:
       text-transform: uppercase;
       margin-bottom: 2px;
     }}
-    .user-tabs {{
-      position: fixed;
-      right: 18px;
-      top: 50%;
-      transform: translateY(-50%);
-      z-index: 90;
-      display: grid;
-      gap: 8px;
-      padding: 10px 8px;
-      border: 1px solid #c6d4cf;
-      border-radius: 14px;
-      background: rgba(255, 255, 255, 0.92);
-      box-shadow: 0 14px 24px rgba(23, 44, 50, 0.14);
-      backdrop-filter: blur(2px);
-    }}
-    .user-tab-label {{
-      margin: 0 2px 2px;
-      font-size: 10px;
-      color: #4b5f64;
-      font-weight: 700;
-      letter-spacing: 0.2px;
-      text-transform: uppercase;
-      text-align: center;
-    }}
-    .user-tab-btn {{
-      width: 76px;
-      min-height: 36px;
-      border: 1px solid #ccd7d3;
-      border-radius: 10px;
-      background: #f7faf9;
-      color: #23464d;
-      font-size: 12px;
-      font-weight: 700;
-      cursor: pointer;
-    }}
-    .user-tab-btn.active {{
-      border-color: #0f6f65;
-      background: #0f6f65;
-      color: #fff;
-      box-shadow: 0 0 0 2px rgba(15, 111, 101, 0.15);
-    }}
     .panel {{
       border: 1px solid var(--line);
       border-radius: 18px;
@@ -2052,15 +2011,6 @@ def index() -> str:
     @media (max-width: 900px) {{
       .wrap {{ width: min(1120px, 96vw); margin-top: 16px; }}
       .checkpoint-badge {{ width: 100%; margin-left: 0; text-align: left; }}
-      .user-tabs {{
-        position: static;
-        transform: none;
-        margin: 0 auto 10px;
-        grid-template-columns: auto auto auto;
-        align-items: center;
-        justify-content: center;
-      }}
-      .user-tab-label {{ margin: 0 6px 0 0; }}
       .panel > form {{ grid-template-columns: 1fr 1fr; }}
       .field-lastmod-start,
       .field-lastmod-end,
@@ -2214,11 +2164,6 @@ def index() -> str:
       </table>
     </section>
   </main>
-  <aside class="user-tabs" aria-label="사용자 설정 탭">
-    <p class="user-tab-label">User</p>
-    <button type="button" class="user-tab-btn {'active' if user_profile == 'hq' else ''}" data-user-profile="hq">본사</button>
-    <button type="button" class="user-tab-btn {'active' if user_profile == 'jaehwa' else ''}" data-user-profile="jaehwa">재화</button>
-  </aside>
   <dialog id="export-dialog" class="export-dialog">
     <form method="dialog" class="export-dialog-body">
       <h3>엑셀 내보내기 범위 선택</h3>
@@ -2240,23 +2185,7 @@ def index() -> str:
     const exportDialog = document.querySelector("#export-dialog");
     const lastModifiedStartDateInput = document.querySelector("#last_modified_start_date");
     const lastModifiedEndDateInput = document.querySelector("#last_modified_end_date");
-    const userProfileInput = document.querySelector("#user_profile");
-    const userTabButtons = document.querySelectorAll("[data-user-profile]");
     const copyButtons = document.querySelectorAll(".copy-btn");
-    let activeUserProfile = (userProfileInput?.value || "hq").trim().toLowerCase();
-    if (!["hq", "jaehwa"].includes(activeUserProfile)) {{
-      activeUserProfile = "hq";
-    }}
-
-    const updateUserTabUI = (profile) => {{
-      userTabButtons.forEach((btn) => {{
-        const isActive = (btn.dataset.userProfile || "") === profile;
-        btn.classList.toggle("active", isActive);
-      }});
-      if (userProfileInput) {{
-        userProfileInput.value = profile;
-      }}
-    }};
 
     const syncLastModifiedDateRange = () => {{
       if (!lastModifiedStartDateInput || !lastModifiedEndDateInput) {{
@@ -2338,25 +2267,6 @@ def index() -> str:
       lastModifiedEndDateInput.addEventListener("change", syncLastModifiedDateRange);
     }}
 
-    if (form) {{
-      updateUserTabUI(activeUserProfile);
-    }}
-
-    userTabButtons.forEach((btn) => {{
-      btn.addEventListener("click", () => {{
-        const nextProfile = (btn.dataset.userProfile || "").trim().toLowerCase();
-        if (!nextProfile || nextProfile === activeUserProfile) {{
-          return;
-        }}
-        activeUserProfile = nextProfile;
-        updateUserTabUI(activeUserProfile);
-        const params = new URLSearchParams(window.location.search);
-        params.set("user_profile", activeUserProfile);
-        params.delete("page");
-        window.location.search = params.toString();
-      }});
-    }});
-
     if (exportButton) {{
       exportButton.addEventListener("click", async () => {{
         const exportScope = await openExportDialog();
@@ -2431,6 +2341,9 @@ def daily_review() -> str | object:
     period_mode = (request.values.get("period_mode") or "previous_day").strip().lower()
     if period_mode not in {"previous_day", "last24h"}:
         period_mode = "previous_day"
+    status_filter = (request.values.get("status_filter") or "pending").strip().lower()
+    if status_filter not in {"all", "pending", "reviewed", "ignored"}:
+        status_filter = "pending"
 
     if period_mode == "previous_day":
         end_dt = now_local.replace(hour=0, minute=0)
@@ -2444,17 +2357,32 @@ def daily_review() -> str | object:
         period_label = f"{start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')}"
 
     if request.method == "POST" and not error_text:
-        cve_id = (request.form.get("cve_id") or "").strip()
-        status = (request.form.get("status") or "pending").strip().lower()
-        note = (request.form.get("note") or "").strip()
-        if not cve_id:
-            error_text = "상태를 저장할 CVE ID가 없습니다."
+        action = (request.form.get("action") or "row_update").strip().lower()
+        if action == "bulk_update":
+            selected_cve_ids = [value.strip() for value in request.form.getlist("selected_cve_id") if value.strip()]
+            bulk_status = (request.form.get("bulk_status") or "pending").strip().lower()
+            bulk_note = (request.form.get("bulk_note") or "").strip()
+            if not selected_cve_ids:
+                error_text = "일괄 변경할 CVE를 선택하세요."
+            else:
+                try:
+                    for cve_id in selected_cve_ids:
+                        upsert_daily_review_item(app_settings, user_profile, review_date, cve_id, bulk_status, bulk_note)
+                    notice_text = f"{len(selected_cve_ids)}건 상태가 일괄 저장되었습니다."
+                except Exception as exc:  # pragma: no cover
+                    error_text = f"일괄 상태 저장 실패: {exc}"
         else:
-            try:
-                upsert_daily_review_item(app_settings, user_profile, review_date, cve_id, status, note)
-                notice_text = f"{cve_id} 상태가 저장되었습니다."
-            except Exception as exc:  # pragma: no cover
-                error_text = f"상태 저장 실패: {exc}"
+            cve_id = (request.form.get("cve_id") or "").strip()
+            status = (request.form.get("status") or "pending").strip().lower()
+            note = (request.form.get("note") or "").strip()
+            if not cve_id:
+                error_text = "상태를 저장할 CVE ID가 없습니다."
+            else:
+                try:
+                    upsert_daily_review_item(app_settings, user_profile, review_date, cve_id, status, note)
+                    notice_text = f"{cve_id} 상태가 저장되었습니다."
+                except Exception as exc:  # pragma: no cover
+                    error_text = f"상태 저장 실패: {exc}"
 
     rows: list[dict[str, object]] = []
     total_count = 0
@@ -2483,6 +2411,7 @@ def daily_review() -> str | object:
             error_text = str(exc)
 
     status_summary = {"pending": 0, "reviewed": 0, "ignored": 0}
+    filtered_count = 0
     row_chunks: list[str] = []
     for row in rows:
         cve_id_raw = str(row.get("id", "UNKNOWN"))
@@ -2492,10 +2421,14 @@ def daily_review() -> str | object:
         if current_status not in status_summary:
             current_status = "pending"
         status_summary[current_status] += 1
+        if status_filter != "all" and current_status != status_filter:
+            continue
+        filtered_count += 1
         current_note = escape(state.get("note", ""))
         score_label, score_class = format_cvss_badge(row.get("cvss_score"))
         row_chunks.append(
             "<tr>"
+            f"<td><input type='checkbox' name='selected_cve_id' value='{cve_id}' form='bulk-form' class='bulk-cve-check'></td>"
             f"<td class='id'>{cve_id}</td>"
             f"<td class='score'><span class='cvss-chip {escape(score_class)}'>{escape(score_label)}</span></td>"
             f"<td>{escape(str(row.get('vuln_type', 'Other')))}</td>"
@@ -2507,6 +2440,8 @@ def daily_review() -> str | object:
             f"<input type='hidden' name='period_mode' value='{escape(period_mode)}'>"
             f"<input type='hidden' name='window_days' value='{window_days}'>"
             f"<input type='hidden' name='review_limit' value='{review_limit}'>"
+            f"<input type='hidden' name='status_filter' value='{escape(status_filter)}'>"
+            "<input type='hidden' name='action' value='row_update'>"
             f"<input type='hidden' name='cve_id' value='{cve_id}'>"
             "<select name='status'>"
             f"<option value='pending' {'selected' if current_status == 'pending' else ''}>미검토</option>"
@@ -2520,13 +2455,14 @@ def daily_review() -> str | object:
             "</tr>"
         )
     if not row_chunks:
-        row_chunks.append("<tr><td colspan='6'>대상 없음</td></tr>")
+        row_chunks.append("<tr><td colspan='7'>대상 없음</td></tr>")
 
     info_lines = [
         f"기간: {period_label}",
         f"필터: vendor={profile_defaults['vendor'] or '-'}, product={profile_defaults['product'] or '-'}, keyword={profile_defaults['keyword'] or '-'}",
         f"필터: impact={', '.join(profile_defaults['impact_type']) if profile_defaults['impact_type'] else '-'}, cpe_objects={len(profile_defaults['cpe_objects_catalog'])}",
         f"검토상태: 미검토 {status_summary['pending']} / 검토완료 {status_summary['reviewed']} / 제외 {status_summary['ignored']}",
+        f"현재 표시 필터: {status_filter} (표시 {filtered_count}건)",
     ]
     notice_html = f"<p class='ok-msg'>{escape(notice_text)}</p>" if notice_text else ""
     error_html = f"<p class='error-msg'>{escape(error_text)}</p>" if error_text else ""
@@ -2553,10 +2489,14 @@ def daily_review() -> str | object:
     .menu-link {{ text-decoration:none; color:var(--ink); border:1px solid var(--line); background:#fff8ed; border-radius:999px; padding:8px 14px; font-size:13px; font-weight:700; }}
     .menu-link.active {{ color:#fff; background:var(--accent-2); border-color:var(--accent-2); }}
     .panel {{ border:1px solid var(--line); background:var(--panel); border-radius:16px; padding:14px; }}
+    .profile-tabs {{ display:flex; gap:8px; margin-bottom:10px; }}
+    .profile-tab {{ text-decoration:none; border:1px solid var(--line); color:var(--ink); padding:6px 12px; border-radius:999px; font-size:13px; font-weight:700; background:#fff; }}
+    .profile-tab.active {{ color:#fff; background:var(--accent-2); border-color:var(--accent-2); }}
     .toolbar {{ display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end; margin-bottom:10px; }}
     .toolbar label {{ font-size:12px; color:var(--muted); display:block; margin-bottom:4px; }}
     .toolbar select,.toolbar input {{ border:1px solid var(--line); border-radius:8px; padding:8px 10px; font:inherit; background:#fff; }}
     .toolbar button {{ border:1px solid var(--line); border-radius:8px; padding:8px 12px; font:inherit; font-weight:700; cursor:pointer; background:#fff; }}
+    .bulk-toolbar {{ margin: 0 0 10px; }}
     .meta {{ margin: 8px 0 10px; font-size: 13px; color: var(--muted); }}
     .ok-msg {{ color:#0c6d57; font-size:13px; font-weight:700; margin: 4px 0; }}
     .error-msg {{ color:#ad3427; font-size:13px; font-weight:700; margin: 4px 0; }}
@@ -2580,6 +2520,10 @@ def daily_review() -> str | object:
     {menu_html}
     <section class="panel">
       <h1 style="margin:0 0 8px;font-size:24px;">일일 검토</h1>
+      <div class="profile-tabs">
+        <a class="profile-tab {'active' if user_profile == 'hq' else ''}" href="/daily?user_profile=hq&period_mode={escape(period_mode)}&window_days={window_days}&review_limit={review_limit}&status_filter={escape(status_filter)}">본사</a>
+        <a class="profile-tab {'active' if user_profile == 'jaehwa' else ''}" href="/daily?user_profile=jaehwa&period_mode={escape(period_mode)}&window_days={window_days}&review_limit={review_limit}&status_filter={escape(status_filter)}">재화</a>
+      </div>
       <form method="get" class="toolbar">
         <input type="hidden" name="user_profile" value="{escape(user_profile)}">
         <div>
@@ -2597,15 +2541,45 @@ def daily_review() -> str | object:
           <label for="review_limit">조회 건수 상한</label>
           <input id="review_limit" name="review_limit" type="number" min="1" max="1000" value="{review_limit}">
         </div>
+        <div>
+          <label for="status_filter">상태 필터</label>
+          <select id="status_filter" name="status_filter">
+            <option value="all" {'selected' if status_filter == 'all' else ''}>전체</option>
+            <option value="pending" {'selected' if status_filter == 'pending' else ''}>미검토</option>
+            <option value="reviewed" {'selected' if status_filter == 'reviewed' else ''}>검토완료</option>
+            <option value="ignored" {'selected' if status_filter == 'ignored' else ''}>제외</option>
+          </select>
+        </div>
         <button type="submit">새로고침</button>
+      </form>
+      <form id="bulk-form" method="post" class="toolbar bulk-toolbar">
+        <input type="hidden" name="action" value="bulk_update">
+        <input type="hidden" name="user_profile" value="{escape(user_profile)}">
+        <input type="hidden" name="period_mode" value="{escape(period_mode)}">
+        <input type="hidden" name="window_days" value="{window_days}">
+        <input type="hidden" name="review_limit" value="{review_limit}">
+        <input type="hidden" name="status_filter" value="{escape(status_filter)}">
+        <div>
+          <label for="bulk_status">일괄 상태</label>
+          <select id="bulk_status" name="bulk_status">
+            <option value="pending">미검토</option>
+            <option value="reviewed">검토완료</option>
+            <option value="ignored">제외</option>
+          </select>
+        </div>
+        <div style="min-width:280px;">
+          <label for="bulk_note">일괄 메모(선택)</label>
+          <input id="bulk_note" name="bulk_note" placeholder="선택된 CVE에 동일 메모 저장">
+        </div>
+        <button type="submit">선택 항목 일괄 저장</button>
       </form>
       {notice_html}
       {error_html}
-      <p class="meta">대상 {total_count}건 (표시 {len(rows)}건) | {' | '.join(escape(line) for line in info_lines)}</p>
+      <p class="meta">대상 {total_count}건 (표시 {filtered_count}건) | {' | '.join(escape(line) for line in info_lines)}</p>
       <table>
         <thead>
           <tr>
-            <th>CVE ID</th><th>CVSS</th><th>Type</th><th>Last Modified</th><th>Description</th><th>Review</th>
+            <th><input id="bulk-select-all" type="checkbox" title="전체 선택"></th><th>CVE ID</th><th>CVSS</th><th>Type</th><th>Last Modified</th><th>Description</th><th>Review</th>
           </tr>
         </thead>
         <tbody>
@@ -2615,6 +2589,25 @@ def daily_review() -> str | object:
     </section>
   </main>
 </body>
+<script>
+  (() => {{
+    const selectAll = document.querySelector("#bulk-select-all");
+    const checks = () => Array.from(document.querySelectorAll(".bulk-cve-check"));
+    selectAll?.addEventListener("change", () => {{
+      const checked = !!selectAll.checked;
+      checks().forEach((el) => {{
+        el.checked = checked;
+      }});
+    }});
+    checks().forEach((el) => {{
+      el.addEventListener("change", () => {{
+        const all = checks();
+        if (!all.length || !selectAll) return;
+        selectAll.checked = all.every((x) => x.checked);
+      }});
+    }});
+  }})();
+</script>
 </html>
 """
 
