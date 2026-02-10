@@ -44,6 +44,7 @@ DEFAULT_PROFILE_SETTINGS: dict[str, object] = {
 }
 _profile_settings_table_ready = False
 _review_status_table_ready = False
+_review_backlog_table_ready = False
 _profile_presets_table_ready = False
 _last_bulk_action_cache: dict[str, dict[str, object]] = {}
 
@@ -189,6 +190,218 @@ def _ensure_review_status_table(settings_obj: Settings) -> None:
     finally:
         conn.close()
     _review_status_table_ready = True
+
+
+def _ensure_review_backlog_table(settings_obj: Settings) -> None:
+    global _review_backlog_table_ready
+    if _review_backlog_table_ready:
+        return
+    conn = _connect_db(settings_obj)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS daily_review_backlog (
+                      profile_key                 text NOT NULL,
+                      cve_id                      text NOT NULL REFERENCES cve (id) ON DELETE CASCADE,
+                      status                      text NOT NULL DEFAULT 'pending',
+                      note                        text NOT NULL DEFAULT '',
+                      first_seen_at               timestamptz NOT NULL DEFAULT now(),
+                      last_seen_at                timestamptz NOT NULL DEFAULT now(),
+                      cve_last_modified_at        timestamptz,
+                      last_processed_modified_at  timestamptz,
+                      needs_recheck               boolean NOT NULL DEFAULT false,
+                      reviewed_at                 timestamptz,
+                      updated_at                  timestamptz NOT NULL DEFAULT now(),
+                      PRIMARY KEY (profile_key, cve_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_daily_review_backlog_status
+                      ON daily_review_backlog (profile_key, status, last_seen_at DESC)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_daily_review_backlog_needs_recheck
+                      ON daily_review_backlog (profile_key, needs_recheck, last_seen_at DESC)
+                    """
+                )
+    finally:
+        conn.close()
+    _review_backlog_table_ready = True
+
+
+def sync_daily_review_backlog(
+    settings_obj: Settings,
+    profile: str,
+    rows: list[dict[str, object]],
+) -> None:
+    if not rows:
+        return
+    _ensure_review_backlog_table(settings_obj)
+    normalized_profile = _normalize_user_profile(profile)
+    conn = _connect_db(settings_obj)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                for row in rows:
+                    cve_id = str(row.get("id", "")).strip()
+                    if not cve_id:
+                        continue
+                    cve_last_modified = row.get("last_modified_at")
+                    cur.execute(
+                        """
+                        INSERT INTO daily_review_backlog (
+                          profile_key,
+                          cve_id,
+                          status,
+                          note,
+                          first_seen_at,
+                          last_seen_at,
+                          cve_last_modified_at,
+                          last_processed_modified_at,
+                          needs_recheck,
+                          reviewed_at,
+                          updated_at
+                        )
+                        VALUES (%s, %s, 'pending', '', now(), now(), %s, NULL, false, NULL, now())
+                        ON CONFLICT (profile_key, cve_id)
+                        DO UPDATE SET
+                          last_seen_at = now(),
+                          cve_last_modified_at = COALESCE(EXCLUDED.cve_last_modified_at, daily_review_backlog.cve_last_modified_at),
+                          needs_recheck = CASE
+                            WHEN daily_review_backlog.status = 'pending' THEN false
+                            WHEN EXCLUDED.cve_last_modified_at IS NOT NULL
+                                 AND (
+                                   daily_review_backlog.last_processed_modified_at IS NULL
+                                   OR EXCLUDED.cve_last_modified_at > daily_review_backlog.last_processed_modified_at
+                                 )
+                            THEN true
+                            ELSE daily_review_backlog.needs_recheck
+                          END,
+                          updated_at = now()
+                        """,
+                        (normalized_profile, cve_id, cve_last_modified),
+                    )
+    finally:
+        conn.close()
+
+
+def fetch_daily_review_backlog_map(
+    settings_obj: Settings,
+    profile: str,
+    cve_ids: list[str],
+) -> dict[str, dict[str, object]]:
+    _ensure_review_backlog_table(settings_obj)
+    normalized_profile = _normalize_user_profile(profile)
+    normalized_ids = [value.strip() for value in cve_ids if value and value.strip()]
+    if not normalized_ids:
+        return {}
+    conn = _connect_db(settings_obj)
+    result: dict[str, dict[str, object]] = {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT cve_id, status, note, needs_recheck
+                FROM daily_review_backlog
+                WHERE profile_key = %s
+                  AND cve_id = ANY(%s)
+                """,
+                (normalized_profile, normalized_ids),
+            )
+            rows = cur.fetchall()
+        for cve_id, status, note, needs_recheck in rows:
+            result[str(cve_id)] = {
+                "status": str(status),
+                "note": str(note or ""),
+                "needs_recheck": bool(needs_recheck),
+            }
+    finally:
+        conn.close()
+    return result
+
+
+def upsert_daily_review_backlog_item(
+    settings_obj: Settings,
+    profile: str,
+    cve_id: str,
+    status: str,
+    note: str,
+) -> None:
+    _ensure_review_backlog_table(settings_obj)
+    normalized_profile = _normalize_user_profile(profile)
+    status_value = status if status in {"pending", "reviewed", "ignored"} else "pending"
+    normalized_cve_id = cve_id.strip()
+    if not normalized_cve_id:
+        return
+    conn = _connect_db(settings_obj)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH current_cve AS (
+                      SELECT last_modified_at
+                      FROM cve
+                      WHERE id = %s
+                    )
+                    INSERT INTO daily_review_backlog (
+                      profile_key,
+                      cve_id,
+                      status,
+                      note,
+                      first_seen_at,
+                      last_seen_at,
+                      cve_last_modified_at,
+                      last_processed_modified_at,
+                      needs_recheck,
+                      reviewed_at,
+                      updated_at
+                    )
+                    VALUES (
+                      %s,
+                      %s,
+                      %s,
+                      %s,
+                      now(),
+                      now(),
+                      (SELECT last_modified_at FROM current_cve),
+                      CASE WHEN %s = 'pending' THEN NULL ELSE (SELECT last_modified_at FROM current_cve) END,
+                      false,
+                      CASE WHEN %s = 'pending' THEN NULL ELSE now() END,
+                      now()
+                    )
+                    ON CONFLICT (profile_key, cve_id)
+                    DO UPDATE SET
+                      status = EXCLUDED.status,
+                      note = EXCLUDED.note,
+                      last_seen_at = now(),
+                      cve_last_modified_at = COALESCE(EXCLUDED.cve_last_modified_at, daily_review_backlog.cve_last_modified_at),
+                      last_processed_modified_at = CASE
+                        WHEN EXCLUDED.status = 'pending' THEN daily_review_backlog.last_processed_modified_at
+                        ELSE COALESCE(EXCLUDED.cve_last_modified_at, daily_review_backlog.last_processed_modified_at)
+                      END,
+                      needs_recheck = false,
+                      reviewed_at = CASE WHEN EXCLUDED.status = 'pending' THEN NULL ELSE now() END,
+                      updated_at = now()
+                    """,
+                    (
+                        normalized_cve_id,
+                        normalized_profile,
+                        normalized_cve_id,
+                        status_value,
+                        note[:500],
+                        status_value,
+                        status_value,
+                    ),
+                )
+    finally:
+        conn.close()
 
 
 def fetch_profile_settings(settings_obj: Settings, profile: str) -> dict[str, object]:
@@ -3166,13 +3379,12 @@ def daily_review() -> str | object:
         utc_midnight = now_utc.replace(hour=0, minute=0)
         start_dt = utc_midnight - timedelta(days=window_days)
         end_dt = now_utc
-        review_date = now_utc.date().isoformat()
         period_label = f"{start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')} UTC"
     else:
         end_dt = now_utc
         start_dt = now_utc - timedelta(hours=24 * window_days)
-        review_date = end_dt.date().isoformat()
         period_label = f"{start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')} UTC"
+    undo_cache_key = f"{user_profile}:backlog"
 
     if request.method == "POST" and not error_text:
         action = (request.form.get("action") or "row_update").strip().lower()
@@ -3191,8 +3403,8 @@ def daily_review() -> str | object:
                 error_text = "일괄 변경할 CVE를 선택하세요."
             else:
                 try:
-                    previous_state = fetch_daily_review_map(app_settings, user_profile, review_date)
-                    _last_bulk_action_cache[f"{user_profile}:{review_date}"] = {
+                    previous_state = fetch_daily_review_backlog_map(app_settings, user_profile, selected_cve_ids)
+                    _last_bulk_action_cache[undo_cache_key] = {
                         "items": [
                             {
                                 "cve_id": cve_id,
@@ -3203,28 +3415,27 @@ def daily_review() -> str | object:
                         ]
                     }
                     for cve_id in selected_cve_ids:
-                        upsert_daily_review_item(app_settings, user_profile, review_date, cve_id, bulk_status, bulk_note)
+                        upsert_daily_review_backlog_item(app_settings, user_profile, cve_id, bulk_status, bulk_note)
                     redirect_query["notice"] = f"{len(selected_cve_ids)}건 상태가 일괄 저장되었습니다."
                     return redirect("/daily?" + urlencode(redirect_query))
                 except Exception as exc:  # pragma: no cover
                     error_text = f"일괄 상태 저장 실패: {exc}"
         elif action == "undo_bulk":
-            last_bulk = _last_bulk_action_cache.get(f"{user_profile}:{review_date}", {})
+            last_bulk = _last_bulk_action_cache.get(undo_cache_key, {})
             items = list(last_bulk.get("items", []))
             if not items:
                 error_text = "되돌릴 최근 일괄 변경이 없습니다."
             else:
                 try:
                     for item in items:
-                        upsert_daily_review_item(
+                        upsert_daily_review_backlog_item(
                             app_settings,
                             user_profile,
-                            review_date,
                             str(item.get("cve_id", "")),
                             str(item.get("status", "pending")),
                             str(item.get("note", "")),
                         )
-                    _last_bulk_action_cache.pop(f"{user_profile}:{review_date}", None)
+                    _last_bulk_action_cache.pop(undo_cache_key, None)
                     redirect_query["notice"] = f"{len(items)}건 일괄 변경을 되돌렸습니다."
                     return redirect("/daily?" + urlencode(redirect_query))
                 except Exception as exc:  # pragma: no cover
@@ -3237,7 +3448,7 @@ def daily_review() -> str | object:
                 error_text = "상태를 저장할 CVE ID가 없습니다."
             else:
                 try:
-                    upsert_daily_review_item(app_settings, user_profile, review_date, cve_id, status, note)
+                    upsert_daily_review_backlog_item(app_settings, user_profile, cve_id, status, note)
                     redirect_query["notice"] = f"{cve_id} 상태가 저장되었습니다."
                     redirect_query["highlight_cve"] = cve_id
                     return redirect("/daily?" + urlencode(redirect_query))
@@ -3309,29 +3520,42 @@ def daily_review() -> str | object:
                     cpe_objects=list(profile_defaults["cpe_objects_catalog"]) or None,
                     include_total_count=True,
                 )
-            review_map = fetch_daily_review_map(app_settings, user_profile, review_date)
+            sync_daily_review_backlog(app_settings, user_profile, rows)
+            review_map = fetch_daily_review_backlog_map(
+                app_settings,
+                user_profile,
+                [str(row.get("id", "")) for row in rows],
+            )
         except Exception as exc:  # pragma: no cover
             error_text = str(exc)
 
     status_summary = {"pending": 0, "reviewed": 0, "ignored": 0}
+    needs_recheck_count = 0
     filtered_count = 0
     row_chunks: list[str] = []
     for row in rows:
         cve_id_raw = str(row.get("id", "UNKNOWN"))
         cve_id = escape(cve_id_raw)
-        state = review_map.get(cve_id_raw, {"status": "pending", "note": ""})
+        state = review_map.get(cve_id_raw, {"status": "pending", "note": "", "needs_recheck": False})
         current_status = state.get("status", "pending")
         if current_status not in status_summary:
             current_status = "pending"
-        status_summary[current_status] += 1
-        if status_filter != "all" and current_status != status_filter:
+        needs_recheck = bool(state.get("needs_recheck", False))
+        display_status = current_status
+        if needs_recheck and current_status in {"reviewed", "ignored"}:
+            display_status = "pending"
+            needs_recheck_count += 1
+        status_summary[display_status] += 1
+        if status_filter != "all" and display_status != status_filter:
             continue
         filtered_count += 1
         current_note = escape(state.get("note", ""))
         score_label, score_class = format_cvss_badge(row.get("cvss_score"))
         status_badge_class = "review-badge pending"
         status_badge_text = "미검토"
-        if current_status == "reviewed":
+        if needs_recheck and current_status in {"reviewed", "ignored"}:
+            status_badge_text = "재검토 필요"
+        elif current_status == "reviewed":
             status_badge_class = "review-badge reviewed"
             status_badge_text = "검토완료"
         elif current_status == "ignored":
@@ -3389,10 +3613,11 @@ def daily_review() -> str | object:
         f"필터: vendor={profile_defaults['vendor'] or '-'}, product={profile_defaults['product'] or '-'}, keyword={profile_defaults['keyword'] or '-'}",
         f"필터: impact={', '.join(profile_defaults['impact_type']) if profile_defaults['impact_type'] else '-'}, cpe_objects={len(profile_defaults['cpe_objects_catalog'])}",
         f"검토상태: 미검토 {status_summary['pending']} / 검토완료 {status_summary['reviewed']} / 제외 {status_summary['ignored']}",
+        f"추가검토 필요: {needs_recheck_count}건",
         f"현재 표시 필터: {status_filter} (표시 {filtered_count}건)",
         f"활성 프리셋: {', '.join(item['preset_name'] for item in active_presets) if active_presets else '없음(프로필 기본 규칙 사용)'}",
     ]
-    has_undo_bulk = bool(_last_bulk_action_cache.get(f"{user_profile}:{review_date}", {}).get("items"))
+    has_undo_bulk = bool(_last_bulk_action_cache.get(undo_cache_key, {}).get("items"))
     quick_status_links = "".join(
         f"<a class='quick-chip {'active' if status_filter == key else ''}' href='/daily?{urlencode({'user_profile': user_profile, 'period_mode': period_mode, 'window_days': str(window_days), 'review_limit': str(review_limit), 'status_filter': key})}'>{label}</a>"
         for key, label in [("pending", "미검토"), ("reviewed", "검토완료"), ("ignored", "제외"), ("all", "전체")]
@@ -3487,7 +3712,7 @@ def daily_review() -> str | object:
     table {{ width:100%; border-collapse: collapse; }}
     th, td {{ border-top:1px solid var(--line); padding:8px 10px; vertical-align:middle; text-align:center; font-size:13px; }}
     th {{ text-align:center; color:var(--muted); font-size:12px; text-transform:uppercase; }}
-    td.last-mod, td.desc {{ text-align:left; vertical-align:top; }}
+    td.last-mod, td.desc {{ text-align:left; vertical-align:middle; }}
     td.last-mod {{ white-space:normal; line-height:1.35; min-width:120px; }}
     .id {{ white-space:nowrap; font-weight:700; }}
     .review-form {{ display:grid; grid-template-columns: 120px 1fr auto; gap:6px; }}
@@ -3995,11 +4220,9 @@ def daily_export_xlsx() -> object:
         utc_midnight = now_utc.replace(hour=0, minute=0)
         start_dt = utc_midnight - timedelta(days=window_days)
         end_dt = now_utc
-        review_date = now_utc.date().isoformat()
     else:
         end_dt = now_utc
         start_dt = now_utc - timedelta(hours=24 * window_days)
-        review_date = end_dt.date().isoformat()
 
     try:
         active_presets = [item for item in fetch_profile_presets(settings_obj, user_profile) if item["is_enabled"]]
@@ -4067,7 +4290,12 @@ def daily_export_xlsx() -> object:
             include_total_count=False,
         )
 
-    review_map = fetch_daily_review_map(settings_obj, user_profile, review_date)
+    sync_daily_review_backlog(settings_obj, user_profile, rows)
+    review_map = fetch_daily_review_backlog_map(
+        settings_obj,
+        user_profile,
+        [str(row.get("id", "")) for row in rows],
+    )
 
     workbook = Workbook()
     sheet = workbook.active
@@ -4091,10 +4319,13 @@ def daily_export_xlsx() -> object:
 
     for row in rows:
         cve_id = str(row.get("id", ""))
-        state = review_map.get(cve_id, {"status": "pending", "note": ""})
+        state = review_map.get(cve_id, {"status": "pending", "note": "", "needs_recheck": False})
         row_status = str(state.get("status", "pending"))
-        if status_filter != "all" and row_status != status_filter:
+        needs_recheck = bool(state.get("needs_recheck", False))
+        display_status = "pending" if needs_recheck and row_status in {"reviewed", "ignored"} else row_status
+        if status_filter != "all" and display_status != status_filter:
             continue
+        export_status = "needs_recheck" if needs_recheck and row_status in {"reviewed", "ignored"} else row_status
         sheet.append(
             [
                 cve_id,
@@ -4104,7 +4335,7 @@ def daily_export_xlsx() -> object:
                 str(row.get("description", "")),
                 "\n".join(str(cpe) for cpe in (row.get("cpe_entries") or [])),
                 ", ".join(matched_preset_map.get(cve_id, [])),
-                row_status,
+                export_status,
                 str(state.get("note", "")),
             ]
         )

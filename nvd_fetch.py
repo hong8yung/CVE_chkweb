@@ -74,6 +74,7 @@ def fetch_cves_from_db(
     last_modified_end: Any | None = None,
     cpe_missing_only: bool = False,
     cpe_objects: list[str] | None = None,
+    cve_ids: list[str] | None = None,
     include_total_count: bool = True,
 ) -> tuple[list[dict[str, Any]], int | None]:
     where_clauses = [
@@ -163,6 +164,11 @@ def fetch_cves_from_db(
     if impact_types:
         where_clauses.append("c.impact_type = ANY(%s)")
         params.append(impact_types)
+    if cve_ids:
+        normalized_ids = [str(value).strip() for value in cve_ids if str(value).strip()]
+        if normalized_ids:
+            where_clauses.append("c.id = ANY(%s)")
+            params.append(normalized_ids)
     if last_modified_start is not None:
         where_clauses.append("c.last_modified_at >= %s")
         params.append(last_modified_start)

@@ -75,6 +75,26 @@ CREATE TABLE IF NOT EXISTS daily_review_item (
   PRIMARY KEY (profile_key, review_date, cve_id)
 );
 
+CREATE TABLE IF NOT EXISTS daily_review_backlog (
+  profile_key                 text NOT NULL,
+  cve_id                      text NOT NULL REFERENCES cve (id) ON DELETE CASCADE,
+  status                      text NOT NULL DEFAULT 'pending',
+  note                        text NOT NULL DEFAULT '',
+  first_seen_at               timestamptz NOT NULL DEFAULT now(),
+  last_seen_at                timestamptz NOT NULL DEFAULT now(),
+  cve_last_modified_at        timestamptz,
+  last_processed_modified_at  timestamptz,
+  needs_recheck               boolean NOT NULL DEFAULT false,
+  reviewed_at                 timestamptz,
+  updated_at                  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (profile_key, cve_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_review_backlog_status
+  ON daily_review_backlog (profile_key, status, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_daily_review_backlog_needs_recheck
+  ON daily_review_backlog (profile_key, needs_recheck, last_seen_at DESC);
+
 CREATE TABLE IF NOT EXISTS user_profile_preset (
   profile_key  text NOT NULL,
   preset_name  text NOT NULL,

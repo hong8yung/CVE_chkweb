@@ -10,9 +10,11 @@ import requests
 from psycopg2.extras import Json, execute_values
 
 from classification import IMPACT_CLASSIFICATION_VERSION, classify_impact_type
+from nvd_fetch import fetch_cves_from_db
 from settings import Settings, load_settings
 
 NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+VALID_USER_PROFILES = ("hq", "jaehwa")
 
 
 def parse_args() -> argparse.Namespace:
@@ -184,7 +186,7 @@ def extract_cpe_matches(cve: dict[str, Any]) -> list[tuple[str, str, str, str, s
     return list(parsed_by_criteria.values())
 
 
-def upsert_cves(conn: psycopg2.extensions.connection, vulnerabilities: list[dict[str, Any]]) -> int:
+def upsert_cves(conn: psycopg2.extensions.connection, vulnerabilities: list[dict[str, Any]]) -> tuple[int, list[str]]:
     upsert_sql = """
     INSERT INTO cve (
         id,
@@ -213,6 +215,7 @@ def upsert_cves(conn: psycopg2.extensions.connection, vulnerabilities: list[dict
     """
 
     count = 0
+    changed_cve_ids: list[str] = []
     with conn.cursor() as cur:
         for item in vulnerabilities:
             cve = item.get("cve", {})
@@ -271,8 +274,175 @@ def upsert_cves(conn: psycopg2.extensions.connection, vulnerabilities: list[dict
                     ],
                 )
             count += 1
+            changed_cve_ids.append(str(cve_id))
     conn.commit()
-    return count
+    return count, changed_cve_ids
+
+
+def ensure_review_backlog_table(conn: psycopg2.extensions.connection) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_review_backlog (
+              profile_key                 text NOT NULL,
+              cve_id                      text NOT NULL REFERENCES cve (id) ON DELETE CASCADE,
+              status                      text NOT NULL DEFAULT 'pending',
+              note                        text NOT NULL DEFAULT '',
+              first_seen_at               timestamptz NOT NULL DEFAULT now(),
+              last_seen_at                timestamptz NOT NULL DEFAULT now(),
+              cve_last_modified_at        timestamptz,
+              last_processed_modified_at  timestamptz,
+              needs_recheck               boolean NOT NULL DEFAULT false,
+              reviewed_at                 timestamptz,
+              updated_at                  timestamptz NOT NULL DEFAULT now(),
+              PRIMARY KEY (profile_key, cve_id)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_daily_review_backlog_status
+              ON daily_review_backlog (profile_key, status, last_seen_at DESC)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_daily_review_backlog_needs_recheck
+              ON daily_review_backlog (profile_key, needs_recheck, last_seen_at DESC)
+            """
+        )
+    conn.commit()
+
+
+def fetch_active_presets(
+    conn: psycopg2.extensions.connection,
+    profile_key: str,
+) -> list[dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT rule_json
+            FROM user_profile_preset
+            WHERE profile_key = %s
+              AND is_enabled = TRUE
+            ORDER BY updated_at DESC, preset_name
+            """,
+            (profile_key,),
+        )
+        rows = cur.fetchall()
+    presets: list[dict[str, Any]] = []
+    for (rule_json,) in rows:
+        if isinstance(rule_json, dict):
+            presets.append(rule_json)
+    return presets
+
+
+def _to_rule_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return []
+
+
+def _to_rule_bool(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _to_rule_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def sync_backlog_from_incremental(settings: Settings, changed_cve_ids: set[str]) -> None:
+    normalized_ids = sorted({value.strip() for value in changed_cve_ids if value and value.strip()})
+    if not normalized_ids:
+        return
+
+    conn = psycopg2.connect(
+        host=settings.db_host,
+        port=settings.db_port,
+        dbname=settings.db_name,
+        user=settings.db_user,
+        password=settings.db_password,
+    )
+    try:
+        ensure_review_backlog_table(conn)
+        for profile_key in VALID_USER_PROFILES:
+            active_presets = fetch_active_presets(conn, profile_key)
+            if not active_presets:
+                continue
+            matched_rows_by_cve: dict[str, dict[str, Any]] = {}
+            for rule in active_presets:
+                preset_rows, _ = fetch_cves_from_db(
+                    settings=settings,
+                    product=str(rule.get("product", "")).strip() or None,
+                    vendor=str(rule.get("vendor", "")).strip() or None,
+                    keyword=str(rule.get("keyword", "")).strip() or None,
+                    impact_types=_to_rule_list(rule.get("impact_type")) or None,
+                    min_cvss=_to_rule_float(rule.get("min_cvss"), 0.0),
+                    limit=max(1, len(normalized_ids)),
+                    offset=0,
+                    sort_by="last_modified",
+                    sort_order="desc",
+                    cpe_missing_only=_to_rule_bool(rule.get("cpe_missing_only")),
+                    cpe_objects=_to_rule_list(rule.get("cpe_objects_catalog")) or None,
+                    cve_ids=normalized_ids,
+                    include_total_count=False,
+                )
+                for row in preset_rows:
+                    cve_id = str(row.get("id", "")).strip()
+                    if not cve_id:
+                        continue
+                    if cve_id not in matched_rows_by_cve:
+                        matched_rows_by_cve[cve_id] = row
+            if not matched_rows_by_cve:
+                continue
+            with conn:
+                with conn.cursor() as cur:
+                    for row in matched_rows_by_cve.values():
+                        cve_id = str(row.get("id", "")).strip()
+                        if not cve_id:
+                            continue
+                        cve_last_modified = row.get("last_modified_at")
+                        cur.execute(
+                            """
+                            INSERT INTO daily_review_backlog (
+                              profile_key,
+                              cve_id,
+                              status,
+                              note,
+                              first_seen_at,
+                              last_seen_at,
+                              cve_last_modified_at,
+                              last_processed_modified_at,
+                              needs_recheck,
+                              reviewed_at,
+                              updated_at
+                            )
+                            VALUES (%s, %s, 'pending', '', now(), now(), %s, NULL, false, NULL, now())
+                            ON CONFLICT (profile_key, cve_id)
+                            DO UPDATE SET
+                              last_seen_at = now(),
+                              cve_last_modified_at = COALESCE(EXCLUDED.cve_last_modified_at, daily_review_backlog.cve_last_modified_at),
+                              needs_recheck = CASE
+                                WHEN daily_review_backlog.status = 'pending' THEN false
+                                WHEN EXCLUDED.cve_last_modified_at IS NOT NULL
+                                     AND (
+                                       daily_review_backlog.last_processed_modified_at IS NULL
+                                       OR EXCLUDED.cve_last_modified_at > daily_review_backlog.last_processed_modified_at
+                                     )
+                                THEN true
+                                ELSE daily_review_backlog.needs_recheck
+                              END,
+                              updated_at = now()
+                            """,
+                            (profile_key, cve_id, cve_last_modified),
+                        )
+    finally:
+        conn.close()
 
 
 def get_checkpoint(conn: psycopg2.extensions.connection) -> datetime | None:
@@ -338,10 +508,11 @@ def finish_job_log(
     conn.commit()
 
 
-def fetch_window(settings: Settings, start: datetime, end: datetime, mode: str) -> tuple[int, int]:
+def fetch_window(settings: Settings, start: datetime, end: datetime, mode: str) -> tuple[int, int, set[str]]:
     headers = {"apiKey": settings.nvd_api_key}
     total_requested = 0
     upserted = 0
+    changed_cve_ids: set[str] = set()
 
     conn = psycopg2.connect(
         host=settings.db_host,
@@ -372,13 +543,15 @@ def fetch_window(settings: Settings, start: datetime, end: datetime, mode: str) 
                 break
 
             total_requested += len(vulnerabilities)
-            upserted += upsert_cves(conn, vulnerabilities)
+            upsert_count, upserted_ids = upsert_cves(conn, vulnerabilities)
+            upserted += upsert_count
+            changed_cve_ids.update(upserted_ids)
 
             start_index += len(vulnerabilities)
             if start_index >= total_results:
                 break
 
-        return total_requested, upserted
+        return total_requested, upserted, changed_cve_ids
     finally:
         conn.close()
 
@@ -402,7 +575,7 @@ def run_initial(settings: Settings) -> None:
 
     try:
         for chunk_start, chunk_end in chunk_ranges(start, end, settings.incremental_window_days):
-            requested, upserted = fetch_window(settings, chunk_start, chunk_end, mode="initial")
+            requested, upserted, _ = fetch_window(settings, chunk_start, chunk_end, mode="initial")
             total_requested += requested
             total_upserted += upserted
 
@@ -459,12 +632,16 @@ def run_incremental(settings: Settings) -> None:
 
     total_requested = 0
     total_upserted = 0
+    changed_cve_ids: set[str] = set()
 
     try:
         for chunk_start, chunk_end in chunk_ranges(start, end, settings.incremental_window_days):
-            requested, upserted = fetch_window(settings, chunk_start, chunk_end, mode="incremental")
+            requested, upserted, changed_ids = fetch_window(settings, chunk_start, chunk_end, mode="incremental")
             total_requested += requested
             total_upserted += upserted
+            changed_cve_ids.update(changed_ids)
+
+        sync_backlog_from_incremental(settings, changed_cve_ids)
 
         conn = psycopg2.connect(
             host=settings.db_host,
