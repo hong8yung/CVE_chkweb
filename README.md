@@ -90,6 +90,13 @@ python3 web_app.py --host 0.0.0.0 --port 8888
 브라우저에서 `http://<server-ip>:8888` 접속 후 조회할 수 있습니다.
 초기 화면(필터 미입력)은 최신 `Last Modified` 순으로 자동 조회됩니다.
 
+메뉴:
+- `검색(/)` 페이지: CVE 조회
+- `설정(/settings)` 페이지: `본사(hq)`/`재화(jaehwa)` 프로필별 기본 검색값 저장
+
+적용 우선순위:
+- URL 파라미터 > 프로필 저장 설정(DB: `user_profile_settings`) > 하드코딩 기본값
+
 지원 필터:
 - `Last Modified Start/End` (날짜+시간 범위)
 - `vendor`, `product`, `min_cvss`, `Impact Type`(다중 선택), `limit`

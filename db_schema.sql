@@ -57,3 +57,9 @@ CREATE TABLE IF NOT EXISTS ingest_checkpoint (
   value_ts   timestamptz NOT NULL,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS user_profile_settings (
+  profile_key   text PRIMARY KEY,
+  settings_json jsonb NOT NULL,
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);

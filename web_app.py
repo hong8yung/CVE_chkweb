@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import re
 import time
@@ -9,19 +10,172 @@ from datetime import datetime, timedelta
 from html import escape
 from urllib.parse import urlencode
 
-from flask import Flask, request, send_file
+import psycopg2
+from flask import Flask, redirect, request, send_file
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from psycopg2.extras import Json
 
 from classification import IMPACT_TYPE_OPTIONS
 from nvd_fetch import fetch_cves_from_db, fetch_incremental_checkpoint
-from settings import load_settings
+from settings import Settings, load_settings
 
 app = Flask(__name__)
 
 COUNT_CACHE_TTL_SECONDS = 120
 COUNT_CACHE_MAX_ENTRIES = 200
 _count_cache: dict[str, tuple[int, float]] = {}
+VALID_USER_PROFILES = {"hq", "jaehwa"}
+VALID_SORT_KEYS = {"cvss_desc", "cvss_asc", "last_modified_desc", "last_modified_asc"}
+DEFAULT_PROFILE_SETTINGS: dict[str, object] = {
+    "vendor": "",
+    "product": "",
+    "keyword": "",
+    "min_cvss": 0.0,
+    "limit": 50,
+    "impact_type": [],
+    "cpe_missing_only": False,
+    "sort_key": "cvss_desc",
+    "last_modified_lookback_days": 7,
+}
+_profile_settings_table_ready = False
+
+
+def _normalize_user_profile(raw_value: str | None) -> str:
+    profile = (raw_value or "hq").strip().lower()
+    return profile if profile in VALID_USER_PROFILES else "hq"
+
+
+def _to_bool(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sanitize_profile_settings(raw_settings: dict[str, object] | None) -> dict[str, object]:
+    clean = dict(DEFAULT_PROFILE_SETTINGS)
+    if not isinstance(raw_settings, dict):
+        return clean
+
+    clean["vendor"] = str(raw_settings.get("vendor", "")).strip()
+    clean["product"] = str(raw_settings.get("product", "")).strip()
+    clean["keyword"] = str(raw_settings.get("keyword", "")).strip()
+
+    try:
+        clean["min_cvss"] = max(0.0, min(float(raw_settings.get("min_cvss", 0.0)), 10.0))
+    except (TypeError, ValueError):
+        clean["min_cvss"] = 0.0
+
+    try:
+        clean["limit"] = max(1, min(int(raw_settings.get("limit", 50)), 500))
+    except (TypeError, ValueError):
+        clean["limit"] = 50
+
+    sort_key = str(raw_settings.get("sort_key", DEFAULT_PROFILE_SETTINGS["sort_key"])).strip().lower()
+    clean["sort_key"] = sort_key if sort_key in VALID_SORT_KEYS else DEFAULT_PROFILE_SETTINGS["sort_key"]
+
+    try:
+        clean["last_modified_lookback_days"] = max(1, min(int(raw_settings.get("last_modified_lookback_days", 7)), 365))
+    except (TypeError, ValueError):
+        clean["last_modified_lookback_days"] = 7
+
+    clean["cpe_missing_only"] = _to_bool(raw_settings.get("cpe_missing_only", False))
+
+    impact_values = raw_settings.get("impact_type", [])
+    if isinstance(impact_values, str):
+        impact_candidates = [value.strip() for value in impact_values.split(",")]
+    elif isinstance(impact_values, list):
+        impact_candidates = [str(value).strip() for value in impact_values]
+    else:
+        impact_candidates = []
+
+    deduped_impacts: list[str] = []
+    for value in impact_candidates:
+        if not value or value not in IMPACT_TYPE_OPTIONS or value in deduped_impacts:
+            continue
+        deduped_impacts.append(value)
+    clean["impact_type"] = deduped_impacts
+    return clean
+
+
+def _connect_db(settings_obj: Settings) -> psycopg2.extensions.connection:
+    return psycopg2.connect(
+        host=settings_obj.db_host,
+        port=settings_obj.db_port,
+        dbname=settings_obj.db_name,
+        user=settings_obj.db_user,
+        password=settings_obj.db_password,
+    )
+
+
+def _ensure_profile_settings_table(settings_obj: Settings) -> None:
+    global _profile_settings_table_ready
+    if _profile_settings_table_ready:
+        return
+    conn = _connect_db(settings_obj)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_profile_settings (
+                      profile_key   text PRIMARY KEY,
+                      settings_json jsonb NOT NULL,
+                      updated_at    timestamptz NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+    finally:
+        conn.close()
+    _profile_settings_table_ready = True
+
+
+def fetch_profile_settings(settings_obj: Settings, profile: str) -> dict[str, object]:
+    normalized_profile = _normalize_user_profile(profile)
+    _ensure_profile_settings_table(settings_obj)
+    conn = _connect_db(settings_obj)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT settings_json FROM user_profile_settings WHERE profile_key = %s",
+                (normalized_profile,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return dict(DEFAULT_PROFILE_SETTINGS)
+    raw_value = row[0]
+    if isinstance(raw_value, dict):
+        return _sanitize_profile_settings(raw_value)
+    if isinstance(raw_value, str):
+        try:
+            return _sanitize_profile_settings(json.loads(raw_value))
+        except json.JSONDecodeError:
+            return dict(DEFAULT_PROFILE_SETTINGS)
+    return dict(DEFAULT_PROFILE_SETTINGS)
+
+
+def upsert_profile_settings(settings_obj: Settings, profile: str, payload: dict[str, object]) -> dict[str, object]:
+    normalized_profile = _normalize_user_profile(profile)
+    sanitized_payload = _sanitize_profile_settings(payload)
+    _ensure_profile_settings_table(settings_obj)
+    conn = _connect_db(settings_obj)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO user_profile_settings (profile_key, settings_json, updated_at)
+                    VALUES (%s, %s, now())
+                    ON CONFLICT (profile_key)
+                    DO UPDATE SET
+                      settings_json = EXCLUDED.settings_json,
+                      updated_at = now()
+                    """,
+                    (normalized_profile, Json(sanitized_payload)),
+                )
+    finally:
+        conn.close()
+    return sanitized_payload
 
 
 def _build_count_cache_key(
@@ -167,6 +321,16 @@ def format_last_modified(value: object) -> str:
             tz_text = f"UTC{sign}{hours:02d}:{minutes:02d}"
         return f"{base} {tz_text}"
     return str(value)
+
+
+def _build_menu_html(active_page: str, user_profile: str | None = None) -> str:
+    profile_query = f"?user_profile={escape(_normalize_user_profile(user_profile))}" if user_profile else ""
+    return (
+        "<nav class='top-menu'>"
+        f"<a class='menu-link {'active' if active_page == 'search' else ''}' href='/{profile_query}'>검색</a>"
+        f"<a class='menu-link {'active' if active_page == 'settings' else ''}' href='/settings{profile_query}'>설정</a>"
+        "</nav>"
+    )
 
 
 @app.get("/export.xlsx")
@@ -390,38 +554,377 @@ def export_xlsx() -> object:
     )
 
 
+@app.route("/settings", methods=["GET", "POST"])
+def settings_page() -> str | object:
+    user_profile = _normalize_user_profile(request.values.get("user_profile"))
+    save_error = ""
+    saved_notice = request.args.get("saved") == "1"
+    reset_notice = request.args.get("reset") == "1"
+
+    app_settings: Settings | None = None
+    profile_settings = dict(DEFAULT_PROFILE_SETTINGS)
+    try:
+        app_settings = load_settings(".env")
+        profile_settings = fetch_profile_settings(app_settings, user_profile)
+    except Exception as exc:  # pragma: no cover
+        save_error = f"설정 로딩 실패: {exc}"
+
+    if request.method == "POST":
+        action = (request.form.get("action") or "save").strip().lower()
+        if action == "reset":
+            if app_settings is None:
+                save_error = "DB 연결 정보를 불러올 수 없어 복원할 수 없습니다."
+            else:
+                try:
+                    upsert_profile_settings(app_settings, user_profile, dict(DEFAULT_PROFILE_SETTINGS))
+                    return redirect(f"/settings?user_profile={user_profile}&reset=1")
+                except Exception as exc:  # pragma: no cover
+                    save_error = f"기본값 복원 실패: {exc}"
+
+        payload = {
+            "vendor": (request.form.get("vendor") or "").strip(),
+            "product": (request.form.get("product") or "").strip(),
+            "keyword": (request.form.get("keyword") or "").strip(),
+            "min_cvss": (request.form.get("min_cvss") or "").strip(),
+            "limit": (request.form.get("limit") or "").strip(),
+            "sort_key": (request.form.get("sort_key") or "").strip(),
+            "last_modified_lookback_days": (request.form.get("last_modified_lookback_days") or "").strip(),
+            "cpe_missing_only": request.form.get("cpe_missing_only") == "1",
+            "impact_type": [value.strip() for value in request.form.getlist("impact_type") if value.strip()],
+        }
+        if action == "save":
+            if app_settings is None:
+                save_error = "DB 연결 정보를 불러올 수 없어 저장할 수 없습니다."
+                profile_settings = _sanitize_profile_settings(payload)
+            else:
+                try:
+                    upsert_profile_settings(app_settings, user_profile, payload)
+                    return redirect(f"/settings?user_profile={user_profile}&saved=1")
+                except Exception as exc:  # pragma: no cover
+                    save_error = f"설정 저장 실패: {exc}"
+                    profile_settings = _sanitize_profile_settings(payload)
+
+    impact_options_html = "".join(
+        "<label class='impact-option'>"
+        f"<input type='checkbox' name='impact_type' value='{escape(option)}' "
+        f"{'checked' if option in profile_settings['impact_type'] else ''}>"
+        f"<span>{escape(option)}</span>"
+        "</label>"
+        for option in IMPACT_TYPE_OPTIONS
+    )
+
+    save_notice_html = "<p class='ok-msg'>저장되었습니다.</p>" if saved_notice and not save_error else ""
+    reset_notice_html = "<p class='ok-msg'>기본값으로 복원되었습니다.</p>" if reset_notice and not save_error else ""
+    error_html = f"<p class='error-msg'>{escape(save_error)}</p>" if save_error else ""
+    menu_html = _build_menu_html("settings", user_profile=user_profile)
+    return f"""
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CVE Settings</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {{
+      --bg: #f7f4ee;
+      --panel: #fffdf8;
+      --ink: #1e2b31;
+      --muted: #5e6c73;
+      --line: #d7d5cc;
+      --accent: #c2482e;
+      --accent-2: #0f6f65;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Space Grotesk", "Pretendard", "Noto Sans KR", sans-serif;
+      color: var(--ink);
+      background: radial-gradient(circle at 0% 0%, #fff9ef 0, #f7f4ee 58%);
+    }}
+    .wrap {{ width: min(980px, 92vw); margin: 26px auto 54px; }}
+    .top-menu {{
+      display: flex;
+      gap: 10px;
+      margin-bottom: 14px;
+    }}
+    .menu-link {{
+      text-decoration: none;
+      color: var(--ink);
+      border: 1px solid var(--line);
+      background: #fff8ed;
+      border-radius: 999px;
+      padding: 8px 14px;
+      font-size: 13px;
+      font-weight: 700;
+    }}
+    .menu-link.active {{
+      color: #fff;
+      background: var(--accent-2);
+      border-color: var(--accent-2);
+    }}
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 20px;
+    }}
+    .header-row {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+    }}
+    .profile-tabs {{
+      display: flex;
+      gap: 8px;
+    }}
+    .tab {{
+      text-decoration: none;
+      border: 1px solid var(--line);
+      color: var(--ink);
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 700;
+      background: #fff;
+    }}
+    .tab.active {{
+      color: #fff;
+      background: var(--accent);
+      border-color: var(--accent);
+    }}
+    form {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px 16px;
+    }}
+    label {{
+      display: block;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }}
+    input, select {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font: inherit;
+      background: #fff;
+    }}
+    .full {{ grid-column: 1 / -1; }}
+    .impact-box {{
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: #fff;
+      max-height: 180px;
+      overflow: auto;
+      display: grid;
+      gap: 8px;
+    }}
+    .impact-option {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--ink);
+    }}
+    .impact-option input {{
+      width: auto;
+      margin: 0;
+    }}
+    .checkbox-row {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 42px;
+    }}
+    .checkbox-row label {{
+      margin: 0;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 600;
+    }}
+    .actions {{
+      grid-column: 1 / -1;
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 6px;
+    }}
+    .btn {{
+      text-decoration: none;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px 14px;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      background: #fff;
+      color: var(--ink);
+    }}
+    .btn.primary {{
+      background: var(--accent-2);
+      color: #fff;
+      border-color: var(--accent-2);
+    }}
+    .ok-msg {{
+      margin: 0 0 10px;
+      color: #0c6d57;
+      font-size: 13px;
+      font-weight: 700;
+    }}
+    .error-msg {{
+      margin: 0 0 10px;
+      color: #ad3427;
+      font-size: 13px;
+      font-weight: 700;
+    }}
+    @media (max-width: 820px) {{
+      form {{ grid-template-columns: 1fr; }}
+      .header-row {{ flex-direction: column; align-items: flex-start; }}
+      .actions {{ justify-content: stretch; }}
+      .btn {{ flex: 1; text-align: center; }}
+    }}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    {menu_html}
+    <section class="panel">
+      <div class="header-row">
+        <div>
+          <h1 style="margin:0 0 4px;font-size:24px;">사용자 설정</h1>
+          <p style="margin:0;color:var(--muted);font-size:13px;">프로필별 기본 검색값을 저장합니다.</p>
+        </div>
+        <div class="profile-tabs">
+          <a class="tab {'active' if user_profile == 'hq' else ''}" href="/settings?user_profile=hq">본사</a>
+          <a class="tab {'active' if user_profile == 'jaehwa' else ''}" href="/settings?user_profile=jaehwa">재화</a>
+        </div>
+      </div>
+      {save_notice_html}
+      {reset_notice_html}
+      {error_html}
+      <form method="post">
+        <input type="hidden" name="user_profile" value="{escape(user_profile)}">
+        <div>
+          <label for="vendor">기본 Vendor</label>
+          <input id="vendor" name="vendor" value="{escape(str(profile_settings['vendor']))}" placeholder="e.g. ivanti">
+        </div>
+        <div>
+          <label for="product">기본 Product</label>
+          <input id="product" name="product" value="{escape(str(profile_settings['product']))}" placeholder="e.g. endpoint_manager_mobile">
+        </div>
+        <div>
+          <label for="keyword">기본 Keyword</label>
+          <input id="keyword" name="keyword" value="{escape(str(profile_settings['keyword']))}" placeholder="e.g. ssl">
+        </div>
+        <div>
+          <label for="min_cvss">기본 Min CVSS</label>
+          <input id="min_cvss" name="min_cvss" type="number" min="0" max="10" step="0.1" value="{escape(str(profile_settings['min_cvss']))}">
+        </div>
+        <div>
+          <label for="limit">기본 Limit (1-500)</label>
+          <input id="limit" name="limit" type="number" min="1" max="500" step="1" value="{escape(str(profile_settings['limit']))}">
+        </div>
+        <div>
+          <label for="sort_key">기본 정렬</label>
+          <select id="sort_key" name="sort_key">
+            <option value="cvss_desc" {'selected' if profile_settings['sort_key'] == 'cvss_desc' else ''}>CVSS 내림차순</option>
+            <option value="cvss_asc" {'selected' if profile_settings['sort_key'] == 'cvss_asc' else ''}>CVSS 오름차순</option>
+            <option value="last_modified_desc" {'selected' if profile_settings['sort_key'] == 'last_modified_desc' else ''}>Last Modified 내림차순</option>
+            <option value="last_modified_asc" {'selected' if profile_settings['sort_key'] == 'last_modified_asc' else ''}>Last Modified 오름차순</option>
+          </select>
+        </div>
+        <div>
+          <label for="last_modified_lookback_days">기본 Last Modified 범위(일)</label>
+          <input id="last_modified_lookback_days" name="last_modified_lookback_days" type="number" min="1" max="365" step="1" value="{escape(str(profile_settings['last_modified_lookback_days']))}">
+        </div>
+        <div class="checkbox-row">
+          <input id="cpe_missing_only" name="cpe_missing_only" type="checkbox" value="1" {'checked' if profile_settings['cpe_missing_only'] else ''}>
+          <label for="cpe_missing_only">기본 CPE missing only 사용</label>
+        </div>
+        <div class="full">
+          <label>기본 Impact Type</label>
+          <div class="impact-box">
+            {impact_options_html}
+          </div>
+        </div>
+        <div class="actions">
+          <a class="btn" href="/?user_profile={escape(user_profile)}">검색으로 이동</a>
+          <button class="btn" type="submit" name="action" value="reset">기본값 복원</button>
+          <button class="btn primary" type="submit">저장</button>
+        </div>
+      </form>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
 @app.get("/")
 def index() -> str:
-    sort_key_param = request.args.get("sort_key")
-    product = (request.args.get("product") or "").strip()
-    vendor = (request.args.get("vendor") or "").strip()
-    keyword = (request.args.get("keyword") or "").strip()
-    user_supplied_last_modified = bool(
-        request.args.get("last_modified_start")
-        or request.args.get("last_modified_end")
-        or request.args.get("last_modified_start_date")
-        or request.args.get("last_modified_start_time")
-        or request.args.get("last_modified_end_date")
-        or request.args.get("last_modified_end_time")
+    user_profile = _normalize_user_profile(request.args.get("user_profile"))
+    app_settings: Settings | None = None
+    profile_defaults = dict(DEFAULT_PROFILE_SETTINGS)
+    bootstrap_error = ""
+    try:
+        app_settings = load_settings(".env")
+        profile_defaults = fetch_profile_settings(app_settings, user_profile)
+    except Exception as exc:  # pragma: no cover
+        bootstrap_error = f"설정 로딩 실패: {exc}"
+
+    product = (
+        (request.args.get("product") if "product" in request.args else str(profile_defaults["product"]) or "").strip()
     )
-    last_modified_start_raw = _compose_datetime_arg("last_modified_start")
-    last_modified_end_raw = _compose_datetime_arg("last_modified_end")
-    if not last_modified_start_raw and not last_modified_end_raw:
+    vendor = (
+        (request.args.get("vendor") if "vendor" in request.args else str(profile_defaults["vendor"]) or "").strip()
+    )
+    keyword = (
+        (request.args.get("keyword") if "keyword" in request.args else str(profile_defaults["keyword"]) or "").strip()
+    )
+
+    user_supplied_last_modified = any(
+        name in request.args
+        for name in {
+            "last_modified_present",
+            "last_modified_start",
+            "last_modified_end",
+            "last_modified_start_date",
+            "last_modified_start_time",
+            "last_modified_end_date",
+            "last_modified_end_time",
+        }
+    )
+    if user_supplied_last_modified:
+        last_modified_start_raw = _compose_datetime_arg("last_modified_start")
+        last_modified_end_raw = _compose_datetime_arg("last_modified_end")
+    else:
+        lookback_days = int(profile_defaults["last_modified_lookback_days"])
         now_local = datetime.now().replace(second=0, microsecond=0)
         last_modified_end_raw = now_local.isoformat(timespec="minutes")
-        last_modified_start_raw = (now_local - timedelta(days=7)).isoformat(timespec="minutes")
+        last_modified_start_raw = (now_local - timedelta(days=lookback_days)).isoformat(timespec="minutes")
     last_modified_start_date_raw, last_modified_start_time_raw = _split_datetime_for_inputs(last_modified_start_raw)
     last_modified_end_date_raw, last_modified_end_time_raw = _split_datetime_for_inputs(last_modified_end_raw)
-    cpe_missing_only = request.args.get("cpe_missing_only") == "1"
-    selected_impacts = [value.strip() for value in request.args.getlist("impact_type") if value.strip()]
-    no_filter_input = (
-        not product
-        and not vendor
-        and not keyword
-        and not user_supplied_last_modified
-        and not cpe_missing_only
-        and not selected_impacts
-    )
+
+    if "cpe_missing_only_present" in request.args or "cpe_missing_only" in request.args:
+        cpe_missing_only = request.args.get("cpe_missing_only") == "1"
+    else:
+        cpe_missing_only = bool(profile_defaults["cpe_missing_only"])
+
+    if "impact_type_present" in request.args or "impact_type" in request.args:
+        selected_impacts = [value.strip() for value in request.args.getlist("impact_type") if value.strip()]
+    else:
+        selected_impacts = list(profile_defaults["impact_type"])
+
     sort_map = {
         "cvss_desc": ("cvss", "desc"),
         "cvss_asc": ("cvss", "asc"),
@@ -429,8 +932,18 @@ def index() -> str:
         "last_modified_asc": ("last_modified", "asc"),
     }
 
-    min_cvss_raw = (request.args.get("min_cvss") or "0").strip()
-    limit_raw = (request.args.get("limit") or "50").strip()
+    min_cvss_raw = (
+        request.args.get("min_cvss")
+        if "min_cvss" in request.args
+        else str(profile_defaults["min_cvss"])
+    )
+    limit_raw = (
+        request.args.get("limit")
+        if "limit" in request.args
+        else str(profile_defaults["limit"])
+    )
+    min_cvss_raw = (min_cvss_raw or "0").strip()
+    limit_raw = (limit_raw or "50").strip()
 
     try:
         min_cvss = float(min_cvss_raw)
@@ -451,12 +964,12 @@ def index() -> str:
     page = max(1, page)
     offset = (page - 1) * limit
 
-    no_filter_input = no_filter_input and (min_cvss == 0.0) and (limit == 50)
-
-    if sort_key_param:
-        sort_key = sort_key_param.strip()
-    else:
-        sort_key = "last_modified_desc" if no_filter_input else "cvss_desc"
+    sort_key_param = (
+        request.args.get("sort_key")
+        if "sort_key" in request.args
+        else str(profile_defaults["sort_key"])
+    )
+    sort_key = (sort_key_param or "cvss_desc").strip().lower()
     sort_by, sort_order = sort_map.get(sort_key, ("cvss", "desc"))
 
     last_modified_start: datetime | None = None
@@ -494,16 +1007,15 @@ def index() -> str:
     ):
         error_text = "Last Modified Start must be earlier than or equal to End."
 
-    if not error_text:
+    if not error_text and not bootstrap_error:
         try:
-            settings = load_settings(".env")
             try:
-                checkpoint_value = fetch_incremental_checkpoint(settings)
+                checkpoint_value = fetch_incremental_checkpoint(app_settings)
                 checkpoint_text = format_last_modified(checkpoint_value) if checkpoint_value else "기록 없음"
             except Exception:
                 checkpoint_text = "조회 실패"
             rows, total_count = fetch_cves_from_db(
-                settings,
+                app_settings,
                 product,
                 vendor or None,
                 keyword or None,
@@ -524,6 +1036,8 @@ def index() -> str:
                 _set_cached_count(count_cache_key, total_count)
         except Exception as exc:  # pragma: no cover
             error_text = str(exc)
+    if bootstrap_error and not error_text:
+        error_text = bootstrap_error
 
     row_chunks: list[str] = []
     for row in rows:
@@ -564,13 +1078,21 @@ def index() -> str:
         rows_html = "<tr><td colspan='7'>No results</td></tr>"
 
     base_query: dict[str, object] = {
+        "user_profile": user_profile,
         "vendor": vendor,
         "product": product,
         "keyword": keyword,
         "min_cvss": str(min_cvss),
         "limit": str(limit),
         "page": str(page),
+        "sort_key": sort_key,
     }
+    if "impact_type_present" in request.args:
+        base_query["impact_type_present"] = "1"
+    if "cpe_missing_only_present" in request.args:
+        base_query["cpe_missing_only_present"] = "1"
+    if "last_modified_present" in request.args:
+        base_query["last_modified_present"] = "1"
     if last_modified_start_raw:
         base_query["last_modified_start"] = last_modified_start_raw
     if last_modified_end_raw:
@@ -653,6 +1175,7 @@ def index() -> str:
     )
 
     error_html = f"<p class='error'>Error: {escape(error_text)}</p>" if error_text else ""
+    menu_html = _build_menu_html("search", user_profile=user_profile)
 
     return f"""
 <!doctype html>
@@ -690,6 +1213,26 @@ def index() -> str:
       width: min(1600px, 90vw);
       margin: 34px auto 54px;
       animation: rise 280ms ease-out;
+    }}
+    .top-menu {{
+      display: flex;
+      gap: 10px;
+      margin-bottom: 12px;
+    }}
+    .menu-link {{
+      text-decoration: none;
+      color: var(--ink);
+      border: 1px solid var(--line);
+      background: #fff8ed;
+      border-radius: 999px;
+      padding: 8px 14px;
+      font-size: 13px;
+      font-weight: 700;
+    }}
+    .menu-link.active {{
+      color: #fff;
+      background: var(--accent-2);
+      border-color: var(--accent-2);
     }}
     .hero {{
       margin-bottom: 14px;
@@ -733,6 +1276,47 @@ def index() -> str:
       letter-spacing: 0.2px;
       text-transform: uppercase;
       margin-bottom: 2px;
+    }}
+    .user-tabs {{
+      position: fixed;
+      right: 18px;
+      top: 50%;
+      transform: translateY(-50%);
+      z-index: 90;
+      display: grid;
+      gap: 8px;
+      padding: 10px 8px;
+      border: 1px solid #c6d4cf;
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 14px 24px rgba(23, 44, 50, 0.14);
+      backdrop-filter: blur(2px);
+    }}
+    .user-tab-label {{
+      margin: 0 2px 2px;
+      font-size: 10px;
+      color: #4b5f64;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+      text-transform: uppercase;
+      text-align: center;
+    }}
+    .user-tab-btn {{
+      width: 76px;
+      min-height: 36px;
+      border: 1px solid #ccd7d3;
+      border-radius: 10px;
+      background: #f7faf9;
+      color: #23464d;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .user-tab-btn.active {{
+      border-color: #0f6f65;
+      background: #0f6f65;
+      color: #fff;
+      box-shadow: 0 0 0 2px rgba(15, 111, 101, 0.15);
     }}
     .panel {{
       border: 1px solid var(--line);
@@ -1193,6 +1777,15 @@ def index() -> str:
     @media (max-width: 900px) {{
       .wrap {{ width: min(1120px, 96vw); margin-top: 16px; }}
       .checkpoint-badge {{ width: 100%; margin-left: 0; text-align: left; }}
+      .user-tabs {{
+        position: static;
+        transform: none;
+        margin: 0 auto 10px;
+        grid-template-columns: auto auto auto;
+        align-items: center;
+        justify-content: center;
+      }}
+      .user-tab-label {{ margin: 0 6px 0 0; }}
       .panel > form {{ grid-template-columns: 1fr 1fr; }}
       .field-lastmod-start,
       .field-lastmod-end,
@@ -1237,6 +1830,7 @@ def index() -> str:
 </head>
   <body>
   <main class="wrap">
+    {menu_html}
     <section class="hero">
       <div class="hero-copy">
         <h1>CVE Explorer</h1>
@@ -1249,6 +1843,10 @@ def index() -> str:
     </section>
     <section class="panel">
       <form method="get">
+        <input id="user_profile" type="hidden" name="user_profile" value="{escape(user_profile)}">
+        <input type="hidden" name="impact_type_present" value="1">
+        <input type="hidden" name="cpe_missing_only_present" value="1">
+        <input type="hidden" name="last_modified_present" value="1">
         <div class="field-lastmod-start">
           <label for="last_modified_start_date">Last Modified Start</label>
           <div class="datetime-parts">
@@ -1330,6 +1928,11 @@ def index() -> str:
       </table>
     </section>
   </main>
+  <aside class="user-tabs" aria-label="사용자 설정 탭">
+    <p class="user-tab-label">User</p>
+    <button type="button" class="user-tab-btn {'active' if user_profile == 'hq' else ''}" data-user-profile="hq">본사</button>
+    <button type="button" class="user-tab-btn {'active' if user_profile == 'jaehwa' else ''}" data-user-profile="jaehwa">재화</button>
+  </aside>
   <dialog id="export-dialog" class="export-dialog">
     <form method="dialog" class="export-dialog-body">
       <h3>엑셀 내보내기 범위 선택</h3>
@@ -1349,7 +1952,43 @@ def index() -> str:
     const shareButton = document.querySelector("#share-url-btn");
     const exportButton = document.querySelector("#export-xlsx-btn");
     const exportDialog = document.querySelector("#export-dialog");
+    const lastModifiedStartDateInput = document.querySelector("#last_modified_start_date");
+    const lastModifiedEndDateInput = document.querySelector("#last_modified_end_date");
+    const userProfileInput = document.querySelector("#user_profile");
+    const userTabButtons = document.querySelectorAll("[data-user-profile]");
     const copyButtons = document.querySelectorAll(".copy-btn");
+    let activeUserProfile = (userProfileInput?.value || "hq").trim().toLowerCase();
+    if (!["hq", "jaehwa"].includes(activeUserProfile)) {{
+      activeUserProfile = "hq";
+    }}
+
+    const updateUserTabUI = (profile) => {{
+      userTabButtons.forEach((btn) => {{
+        const isActive = (btn.dataset.userProfile || "") === profile;
+        btn.classList.toggle("active", isActive);
+      }});
+      if (userProfileInput) {{
+        userProfileInput.value = profile;
+      }}
+    }};
+
+    const syncLastModifiedDateRange = () => {{
+      if (!lastModifiedStartDateInput || !lastModifiedEndDateInput) {{
+        return;
+      }}
+      const startValue = (lastModifiedStartDateInput.value || "").trim();
+      if (startValue) {{
+        lastModifiedEndDateInput.min = startValue;
+        lastModifiedEndDateInput.title = `End date must be on or after ${{startValue}}`;
+      }} else {{
+        lastModifiedEndDateInput.removeAttribute("min");
+        lastModifiedEndDateInput.title = "";
+      }}
+      const endValue = (lastModifiedEndDateInput.value || "").trim();
+      if (startValue && endValue && endValue < startValue) {{
+        lastModifiedEndDateInput.value = startValue;
+      }}
+    }};
 
     const openExportDialog = () => {{
       if (!exportDialog || typeof exportDialog.showModal !== "function") {{
@@ -1404,6 +2043,33 @@ def index() -> str:
         }}
       }});
     }}
+
+    if (lastModifiedStartDateInput && lastModifiedEndDateInput) {{
+      syncLastModifiedDateRange();
+      lastModifiedStartDateInput.addEventListener("change", syncLastModifiedDateRange);
+      lastModifiedStartDateInput.addEventListener("input", syncLastModifiedDateRange);
+      lastModifiedEndDateInput.addEventListener("focus", syncLastModifiedDateRange);
+      lastModifiedEndDateInput.addEventListener("change", syncLastModifiedDateRange);
+    }}
+
+    if (form) {{
+      updateUserTabUI(activeUserProfile);
+    }}
+
+    userTabButtons.forEach((btn) => {{
+      btn.addEventListener("click", () => {{
+        const nextProfile = (btn.dataset.userProfile || "").trim().toLowerCase();
+        if (!nextProfile || nextProfile === activeUserProfile) {{
+          return;
+        }}
+        activeUserProfile = nextProfile;
+        updateUserTabUI(activeUserProfile);
+        const params = new URLSearchParams(window.location.search);
+        params.set("user_profile", activeUserProfile);
+        params.delete("page");
+        window.location.search = params.toString();
+      }});
+    }});
 
     if (exportButton) {{
       exportButton.addEventListener("click", async () => {{
