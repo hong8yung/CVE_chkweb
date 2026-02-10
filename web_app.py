@@ -43,6 +43,7 @@ DEFAULT_PROFILE_SETTINGS: dict[str, object] = {
 }
 _profile_settings_table_ready = False
 _review_status_table_ready = False
+_profile_presets_table_ready = False
 
 
 def _normalize_user_profile(raw_value: str | None) -> str:
@@ -293,6 +294,141 @@ def upsert_daily_review_item(
                       updated_at = now()
                     """,
                     (normalized_profile, review_date, cve_id, status_value, note[:500], status_value),
+                )
+    finally:
+        conn.close()
+
+
+def _ensure_profile_presets_table(settings_obj: Settings) -> None:
+    global _profile_presets_table_ready
+    if _profile_presets_table_ready:
+        return
+    conn = _connect_db(settings_obj)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_profile_preset (
+                      profile_key  text NOT NULL,
+                      preset_name  text NOT NULL,
+                      rule_json    jsonb NOT NULL,
+                      is_enabled   boolean NOT NULL DEFAULT true,
+                      updated_at   timestamptz NOT NULL DEFAULT now(),
+                      PRIMARY KEY (profile_key, preset_name)
+                    )
+                    """
+                )
+    finally:
+        conn.close()
+    _profile_presets_table_ready = True
+
+
+def fetch_profile_presets(settings_obj: Settings, profile: str) -> list[dict[str, object]]:
+    _ensure_profile_presets_table(settings_obj)
+    normalized_profile = _normalize_user_profile(profile)
+    conn = _connect_db(settings_obj)
+    rows: list[tuple[object, object, object]] = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT preset_name, rule_json, is_enabled
+                FROM user_profile_preset
+                WHERE profile_key = %s
+                ORDER BY preset_name
+                """,
+                (normalized_profile,),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    presets: list[dict[str, object]] = []
+    for preset_name, rule_json, is_enabled in rows:
+        rule = _sanitize_profile_settings(rule_json if isinstance(rule_json, dict) else {})
+        presets.append(
+            {
+                "preset_name": str(preset_name),
+                "rule": rule,
+                "is_enabled": bool(is_enabled),
+            }
+        )
+    return presets
+
+
+def upsert_profile_preset(
+    settings_obj: Settings,
+    profile: str,
+    preset_name: str,
+    rule_payload: dict[str, object],
+    enabled: bool = True,
+) -> None:
+    _ensure_profile_presets_table(settings_obj)
+    normalized_profile = _normalize_user_profile(profile)
+    normalized_name = preset_name.strip()
+    if not normalized_name:
+        raise ValueError("preset_name is required")
+    clean_rule = _sanitize_profile_settings(rule_payload)
+    conn = _connect_db(settings_obj)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO user_profile_preset (profile_key, preset_name, rule_json, is_enabled, updated_at)
+                    VALUES (%s, %s, %s, %s, now())
+                    ON CONFLICT (profile_key, preset_name)
+                    DO UPDATE SET
+                      rule_json = EXCLUDED.rule_json,
+                      is_enabled = EXCLUDED.is_enabled,
+                      updated_at = now()
+                    """,
+                    (normalized_profile, normalized_name, Json(clean_rule), bool(enabled)),
+                )
+    finally:
+        conn.close()
+
+
+def set_profile_preset_enabled(
+    settings_obj: Settings,
+    profile: str,
+    preset_name: str,
+    enabled: bool,
+) -> None:
+    _ensure_profile_presets_table(settings_obj)
+    normalized_profile = _normalize_user_profile(profile)
+    conn = _connect_db(settings_obj)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE user_profile_preset
+                    SET is_enabled = %s, updated_at = now()
+                    WHERE profile_key = %s
+                      AND preset_name = %s
+                    """,
+                    (bool(enabled), normalized_profile, preset_name.strip()),
+                )
+    finally:
+        conn.close()
+
+
+def delete_profile_preset(settings_obj: Settings, profile: str, preset_name: str) -> None:
+    _ensure_profile_presets_table(settings_obj)
+    normalized_profile = _normalize_user_profile(profile)
+    conn = _connect_db(settings_obj)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM user_profile_preset
+                    WHERE profile_key = %s
+                      AND preset_name = %s
+                    """,
+                    (normalized_profile, preset_name.strip()),
                 )
     finally:
         conn.close()
@@ -777,12 +913,14 @@ def settings_page() -> str | object:
     saved_notice = request.args.get("saved") == "1"
     reset_notice = request.args.get("reset") == "1"
     preview_notice = ""
+    presets: list[dict[str, object]] = []
 
     app_settings: Settings | None = None
     profile_settings = dict(DEFAULT_PROFILE_SETTINGS)
     try:
         app_settings = load_settings(".env")
         profile_settings = fetch_profile_settings(app_settings, user_profile)
+        presets = fetch_profile_presets(app_settings, user_profile)
     except Exception as exc:  # pragma: no cover
         save_error = f"설정 로딩 실패: {exc}"
 
@@ -797,6 +935,53 @@ def settings_page() -> str | object:
                     return redirect(f"/settings?user_profile={user_profile}&reset=1")
                 except Exception as exc:  # pragma: no cover
                     save_error = f"기본값 복원 실패: {exc}"
+        elif action == "save_preset":
+            preset_name = (request.form.get("preset_name") or "").strip()
+            if not preset_name:
+                save_error = "프리셋 이름을 입력하세요."
+            elif app_settings is None:
+                save_error = "DB 연결 정보를 불러올 수 없어 프리셋을 저장할 수 없습니다."
+            else:
+                try:
+                    candidate_payload = {
+                        "vendor": (request.form.get("vendor") or "").strip(),
+                        "product": (request.form.get("product") or "").strip(),
+                        "keyword": (request.form.get("keyword") or "").strip(),
+                        "cpe_objects_catalog": (request.form.get("cpe_objects_catalog") or "").strip(),
+                        "min_cvss": (request.form.get("min_cvss") or "").strip(),
+                        "limit": (request.form.get("limit") or "").strip(),
+                        "sort_key": (request.form.get("sort_key") or "").strip(),
+                        "last_modified_lookback_days": (request.form.get("last_modified_lookback_days") or "").strip(),
+                        "daily_review_window_days": (request.form.get("daily_review_window_days") or "").strip(),
+                        "daily_review_limit": (request.form.get("daily_review_limit") or "").strip(),
+                        "cpe_missing_only": request.form.get("cpe_missing_only") == "1",
+                        "impact_type": [value.strip() for value in request.form.getlist("impact_type") if value.strip()],
+                    }
+                    upsert_profile_preset(app_settings, user_profile, preset_name, candidate_payload, enabled=True)
+                    preview_notice = f"프리셋 '{preset_name}' 저장 완료"
+                except Exception as exc:  # pragma: no cover
+                    save_error = f"프리셋 저장 실패: {exc}"
+        elif action == "toggle_preset":
+            preset_name = (request.form.get("preset_name") or "").strip()
+            enabled_value = request.form.get("preset_enabled") == "1"
+            if app_settings is None:
+                save_error = "DB 연결 정보를 불러올 수 없어 프리셋 상태를 변경할 수 없습니다."
+            else:
+                try:
+                    set_profile_preset_enabled(app_settings, user_profile, preset_name, enabled_value)
+                    preview_notice = f"프리셋 '{preset_name}' 상태 변경 완료"
+                except Exception as exc:  # pragma: no cover
+                    save_error = f"프리셋 상태 변경 실패: {exc}"
+        elif action == "delete_preset":
+            preset_name = (request.form.get("preset_name") or "").strip()
+            if app_settings is None:
+                save_error = "DB 연결 정보를 불러올 수 없어 프리셋을 삭제할 수 없습니다."
+            else:
+                try:
+                    delete_profile_preset(app_settings, user_profile, preset_name)
+                    preview_notice = f"프리셋 '{preset_name}' 삭제 완료"
+                except Exception as exc:  # pragma: no cover
+                    save_error = f"프리셋 삭제 실패: {exc}"
 
         payload = {
             "vendor": (request.form.get("vendor") or "").strip(),
@@ -854,6 +1039,8 @@ def settings_page() -> str | object:
                     )
                 except Exception as exc:  # pragma: no cover
                     save_error = f"미리보기 실패: {exc}"
+        if app_settings is not None:
+            presets = fetch_profile_presets(app_settings, user_profile)
 
     impact_options_html = "".join(
         "<label class='impact-option'>"
@@ -870,6 +1057,35 @@ def settings_page() -> str | object:
     error_html = f"<p class='error-msg'>{escape(save_error)}</p>" if save_error else ""
     menu_html = _build_menu_html("settings", user_profile=user_profile)
     cpe_catalog_json = json.dumps(profile_settings["cpe_objects_catalog"])
+    preset_rows_html = "".join(
+        (
+            "<tr>"
+            f"<td>{escape(str(item['preset_name']))}</td>"
+            f"<td>{'ON' if item['is_enabled'] else 'OFF'}</td>"
+            f"<td>{escape(str(item['rule'].get('vendor') or '-'))}</td>"
+            f"<td>{escape(str(item['rule'].get('product') or '-'))}</td>"
+            f"<td>{len(item['rule'].get('cpe_objects_catalog', []))}</td>"
+            "<td>"
+            "<form method='post' style='display:inline-flex;gap:6px;align-items:center;'>"
+            f"<input type='hidden' name='user_profile' value='{escape(user_profile)}'>"
+            "<input type='hidden' name='action' value='toggle_preset'>"
+            f"<input type='hidden' name='preset_name' value='{escape(str(item['preset_name']))}'>"
+            f"<input type='hidden' name='preset_enabled' value='{'0' if item['is_enabled'] else '1'}'>"
+            f"<button class='btn' type='submit'>{'비활성화' if item['is_enabled'] else '활성화'}</button>"
+            "</form>"
+            "<form method='post' style='display:inline-flex;margin-left:6px;'>"
+            f"<input type='hidden' name='user_profile' value='{escape(user_profile)}'>"
+            "<input type='hidden' name='action' value='delete_preset'>"
+            f"<input type='hidden' name='preset_name' value='{escape(str(item['preset_name']))}'>"
+            "<button class='btn' type='submit'>삭제</button>"
+            "</form>"
+            "</td>"
+            "</tr>"
+        )
+        for item in presets
+    )
+    if not preset_rows_html:
+        preset_rows_html = "<tr><td colspan='6'>등록된 프리셋 없음</td></tr>"
     return f"""
 <!doctype html>
 <html lang="ko">
@@ -1136,10 +1352,30 @@ def settings_page() -> str | object:
         <div class="actions">
           <a class="btn" href="/?user_profile={escape(user_profile)}">검색으로 이동</a>
           <button class="btn" type="submit" name="action" value="reset">기본값 복원</button>
+          <input class="btn" name="preset_name" placeholder="프리셋 이름">
+          <button class="btn" type="submit" name="action" value="save_preset">현재값을 프리셋 저장</button>
           <button class="btn" type="submit" name="action" value="preview">미리보기</button>
           <button class="btn primary" type="submit">저장</button>
         </div>
       </form>
+      <div class="full" style="margin-top:12px;">
+        <h3 style="margin:8px 0;font-size:16px;">프리셋 목록 (일일검토 OR 합집합 대상)</h3>
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+          <thead>
+            <tr>
+              <th style="text-align:left;border-top:1px solid var(--line);padding:8px;">프리셋</th>
+              <th style="text-align:left;border-top:1px solid var(--line);padding:8px;">상태</th>
+              <th style="text-align:left;border-top:1px solid var(--line);padding:8px;">Vendor</th>
+              <th style="text-align:left;border-top:1px solid var(--line);padding:8px;">Product</th>
+              <th style="text-align:left;border-top:1px solid var(--line);padding:8px;">CPE 수</th>
+              <th style="text-align:left;border-top:1px solid var(--line);padding:8px;">관리</th>
+            </tr>
+          </thead>
+          <tbody>
+            {preset_rows_html}
+          </tbody>
+        </table>
+      </div>
     </section>
   </main>
 </body>
@@ -2492,6 +2728,12 @@ def daily_review() -> str | object:
         profile_defaults = fetch_profile_settings(app_settings, user_profile)
     except Exception as exc:  # pragma: no cover
         error_text = f"설정 로딩 실패: {exc}"
+    active_presets: list[dict[str, object]] = []
+    if app_settings is not None:
+        try:
+            active_presets = [item for item in fetch_profile_presets(app_settings, user_profile) if item["is_enabled"]]
+        except Exception:
+            active_presets = []
 
     now_local = datetime.now().replace(second=0, microsecond=0)
     window_days_raw = request.values.get("window_days") or str(profile_defaults["daily_review_window_days"])
@@ -2554,25 +2796,68 @@ def daily_review() -> str | object:
     rows: list[dict[str, object]] = []
     total_count = 0
     review_map: dict[str, dict[str, str]] = {}
+    matched_preset_map: dict[str, list[str]] = {}
     if not error_text:
         try:
-            rows, total_count = fetch_cves_from_db(
-                app_settings,
-                str(profile_defaults["product"]) or None,
-                str(profile_defaults["vendor"]) or None,
-                str(profile_defaults["keyword"]) or None,
-                list(profile_defaults["impact_type"]) or None,
-                float(profile_defaults["min_cvss"]),
-                review_limit,
-                offset=0,
-                sort_by="last_modified",
-                sort_order="desc",
-                last_modified_start=start_dt,
-                last_modified_end=end_dt,
-                cpe_missing_only=bool(profile_defaults["cpe_missing_only"]),
-                cpe_objects=list(profile_defaults["cpe_objects_catalog"]) or None,
-                include_total_count=True,
-            )
+            if active_presets:
+                merged_by_cve: dict[str, dict[str, object]] = {}
+                for preset in active_presets:
+                    preset_name = str(preset["preset_name"])
+                    rule = dict(preset["rule"])
+                    preset_rows, _ = fetch_cves_from_db(
+                        app_settings,
+                        str(rule["product"]) or None,
+                        str(rule["vendor"]) or None,
+                        str(rule["keyword"]) or None,
+                        list(rule["impact_type"]) or None,
+                        float(rule["min_cvss"]),
+                        review_limit,
+                        offset=0,
+                        sort_by="last_modified",
+                        sort_order="desc",
+                        last_modified_start=start_dt,
+                        last_modified_end=end_dt,
+                        cpe_missing_only=bool(rule["cpe_missing_only"]),
+                        cpe_objects=list(rule["cpe_objects_catalog"]) or None,
+                        include_total_count=False,
+                    )
+                    for row in preset_rows:
+                        cve_id = str(row.get("id", ""))
+                        if not cve_id:
+                            continue
+                        if cve_id not in merged_by_cve:
+                            merged_by_cve[cve_id] = row
+                        matched_preset_map.setdefault(cve_id, [])
+                        if preset_name not in matched_preset_map[cve_id]:
+                            matched_preset_map[cve_id].append(preset_name)
+                rows = list(merged_by_cve.values())
+                rows.sort(
+                    key=lambda row: (
+                        row.get("last_modified_at") or datetime.min,
+                        float(row.get("cvss_score") or 0.0),
+                    ),
+                    reverse=True,
+                )
+                total_count = len(rows)
+                rows = rows[:review_limit]
+            else:
+                rows, total_count = fetch_cves_from_db(
+                    app_settings,
+                    str(profile_defaults["product"]) or None,
+                    str(profile_defaults["vendor"]) or None,
+                    str(profile_defaults["keyword"]) or None,
+                    list(profile_defaults["impact_type"]) or None,
+                    float(profile_defaults["min_cvss"]),
+                    review_limit,
+                    offset=0,
+                    sort_by="last_modified",
+                    sort_order="desc",
+                    last_modified_start=start_dt,
+                    last_modified_end=end_dt,
+                    cpe_missing_only=bool(profile_defaults["cpe_missing_only"]),
+                    cpe_objects=list(profile_defaults["cpe_objects_catalog"]) or None,
+                    include_total_count=True,
+                )
             review_map = fetch_daily_review_map(app_settings, user_profile, review_date)
         except Exception as exc:  # pragma: no cover
             error_text = str(exc)
@@ -2601,6 +2886,7 @@ def daily_review() -> str | object:
             f"<td>{escape(str(row.get('vuln_type', 'Other')))}</td>"
             f"<td>{escape(format_last_modified(row.get('last_modified_at', 'N/A')))}</td>"
             f"<td>{escape(shorten(str(row.get('description', '')), 120))}</td>"
+            f"<td>{escape(', '.join(matched_preset_map.get(cve_id_raw, [])) or '-')}</td>"
             "<td>"
             "<form method='post' class='review-form'>"
             f"<input type='hidden' name='user_profile' value='{escape(user_profile)}'>"
@@ -2622,7 +2908,7 @@ def daily_review() -> str | object:
             "</tr>"
         )
     if not row_chunks:
-        row_chunks.append("<tr><td colspan='7'>대상 없음</td></tr>")
+        row_chunks.append("<tr><td colspan='8'>대상 없음</td></tr>")
 
     info_lines = [
         f"기간: {period_label}",
@@ -2630,6 +2916,7 @@ def daily_review() -> str | object:
         f"필터: impact={', '.join(profile_defaults['impact_type']) if profile_defaults['impact_type'] else '-'}, cpe_objects={len(profile_defaults['cpe_objects_catalog'])}",
         f"검토상태: 미검토 {status_summary['pending']} / 검토완료 {status_summary['reviewed']} / 제외 {status_summary['ignored']}",
         f"현재 표시 필터: {status_filter} (표시 {filtered_count}건)",
+        f"활성 프리셋: {', '.join(item['preset_name'] for item in active_presets) if active_presets else '없음(프로필 기본 규칙 사용)'}",
     ]
     notice_html = f"<p class='ok-msg'>{escape(notice_text)}</p>" if notice_text else ""
     error_html = f"<p class='error-msg'>{escape(error_text)}</p>" if error_text else ""
@@ -2746,7 +3033,7 @@ def daily_review() -> str | object:
       <table>
         <thead>
           <tr>
-            <th><input id="bulk-select-all" type="checkbox" title="전체 선택"></th><th>CVE ID</th><th>CVSS</th><th>Type</th><th>Last Modified</th><th>Description</th><th>Review</th>
+            <th><input id="bulk-select-all" type="checkbox" title="전체 선택"></th><th>CVE ID</th><th>CVSS</th><th>Type</th><th>Last Modified</th><th>Description</th><th>Preset</th><th>Review</th>
           </tr>
         </thead>
         <tbody>

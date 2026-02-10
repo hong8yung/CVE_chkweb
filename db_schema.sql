@@ -74,3 +74,12 @@ CREATE TABLE IF NOT EXISTS daily_review_item (
   updated_at   timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (profile_key, review_date, cve_id)
 );
+
+CREATE TABLE IF NOT EXISTS user_profile_preset (
+  profile_key  text NOT NULL,
+  preset_name  text NOT NULL,
+  rule_json    jsonb NOT NULL,
+  is_enabled   boolean NOT NULL DEFAULT true,
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (profile_key, preset_name)
+);

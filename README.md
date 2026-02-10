@@ -109,11 +109,15 @@ python3 web_app.py --host 0.0.0.0 --port 8888
 - 프로필 저장 규칙(`vendor`, `product`, `keyword`, `Impact Type`, `CPE Object`, `min_cvss`) 기반으로 자동 조회
 - 기간 기준(`전일 마감`, `최근 24h`) + 기간(일) 선택 가능
 - 행별 검토 상태(`미검토/검토완료/제외`)와 메모 저장
+- 상태 필터(`전체/미검토/검토완료/제외`) 및 선택 항목 일괄 상태 변경 지원
+- 설정 페이지에서 만든 활성 프리셋들을 OR 합집합으로 조회
 
 설정 페이지 CPE UX:
 - CPE 객체를 `vendor/product/version` 입력 후 추가
 - 등록 목록은 칩으로 표시되며 즉시 삭제 가능
 - `미리보기` 버튼으로 최근 N일 기준 예상 검토 대상 건수 확인
+- `vendor/product/version` 입력란 자동완성 API (`/api/cpe/suggest`) 제공
+- 현재 입력값을 프리셋으로 저장하고, 프리셋 활성/비활성/삭제 가능
 
 표시/동작:
 - `CVSS`는 등급+점수 칩으로 표시 (`None/Low/Medium/High/Critical`)
