@@ -11,7 +11,7 @@ from html import escape
 from urllib.parse import urlencode
 
 import psycopg2
-from flask import Flask, redirect, request, send_file
+from flask import Flask, jsonify, redirect, request, send_file
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from psycopg2.extras import Json
@@ -296,6 +296,93 @@ def upsert_daily_review_item(
                 )
     finally:
         conn.close()
+
+
+def fetch_cpe_autocomplete_suggestions(
+    settings_obj: Settings,
+    vendor_prefix: str,
+    product_prefix: str,
+    version_prefix: str,
+    max_items: int = 10,
+) -> dict[str, list[str]]:
+    vendor_key = vendor_prefix.strip().lower()
+    product_key = product_prefix.strip().lower()
+    version_key = version_prefix.strip().lower()
+    limit = max(1, min(int(max_items), 20))
+    vendors: list[str] = []
+    products: list[str] = []
+    versions: list[str] = []
+
+    conn = _connect_db(settings_obj)
+    try:
+        with conn.cursor() as cur:
+            if len(vendor_key) >= 2:
+                cur.execute(
+                    """
+                    SELECT DISTINCT cc.vendor
+                    FROM cve_cpe AS cc
+                    WHERE cc.vulnerable = TRUE
+                      AND cc.vendor ILIKE %s
+                    ORDER BY cc.vendor
+                    LIMIT %s
+                    """,
+                    (f"{vendor_key}%", limit),
+                )
+                vendors = [str(row[0]) for row in cur.fetchall() if row and row[0]]
+
+            if len(product_key) >= 2:
+                if vendor_key:
+                    cur.execute(
+                        """
+                        SELECT DISTINCT cc.product
+                        FROM cve_cpe AS cc
+                        WHERE cc.vulnerable = TRUE
+                          AND LOWER(cc.vendor) = %s
+                          AND cc.product ILIKE %s
+                        ORDER BY cc.product
+                        LIMIT %s
+                        """,
+                        (vendor_key, f"{product_key}%", limit),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT DISTINCT cc.product
+                        FROM cve_cpe AS cc
+                        WHERE cc.vulnerable = TRUE
+                          AND cc.product ILIKE %s
+                        ORDER BY cc.product
+                        LIMIT %s
+                        """,
+                        (f"{product_key}%", limit),
+                    )
+                products = [str(row[0]) for row in cur.fetchall() if row and row[0]]
+
+            if len(version_key) >= 1 and vendor_key and product_key:
+                cur.execute(
+                    """
+                    SELECT DISTINCT cc.version
+                    FROM cve_cpe AS cc
+                    WHERE cc.vulnerable = TRUE
+                      AND LOWER(cc.vendor) = %s
+                      AND LOWER(cc.product) = %s
+                      AND cc.version IS NOT NULL
+                      AND cc.version <> ''
+                      AND cc.version ILIKE %s
+                    ORDER BY cc.version
+                    LIMIT %s
+                    """,
+                    (vendor_key, product_key, f"{version_key}%", limit),
+                )
+                versions = [str(row[0]) for row in cur.fetchall() if row and row[0]]
+    finally:
+        conn.close()
+
+    return {
+        "vendors": vendors,
+        "products": products,
+        "versions": versions,
+    }
 
 
 def _build_count_cache_key(
@@ -998,11 +1085,14 @@ def settings_page() -> str | object:
           <input type="hidden" id="cpe_objects_catalog" name="cpe_objects_catalog" value="{escape(chr(10).join(profile_settings['cpe_objects_catalog']))}">
           <div class="impact-box" id="cpe-catalog-list" style="max-height:none;min-height:60px;"></div>
           <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;margin-top:8px;">
-            <input id="cpe_vendor" placeholder="vendor (e.g. ivanti)">
-            <input id="cpe_product" placeholder="product (e.g. pulse_connect_secure)">
-            <input id="cpe_version" placeholder="version (optional)">
+            <input id="cpe_vendor" list="cpe_vendor_suggestions" placeholder="vendor (e.g. ivanti)">
+            <input id="cpe_product" list="cpe_product_suggestions" placeholder="product (e.g. pulse_connect_secure)">
+            <input id="cpe_version" list="cpe_version_suggestions" placeholder="version (optional)">
             <button class="btn" type="button" id="add-cpe-btn">추가</button>
           </div>
+          <datalist id="cpe_vendor_suggestions"></datalist>
+          <datalist id="cpe_product_suggestions"></datalist>
+          <datalist id="cpe_version_suggestions"></datalist>
         </div>
         <div>
           <label for="min_cvss">기본 Min CVSS</label>
@@ -1061,9 +1151,61 @@ def settings_page() -> str | object:
     const vendorInput = document.querySelector("#cpe_vendor");
     const productInput = document.querySelector("#cpe_product");
     const versionInput = document.querySelector("#cpe_version");
+    const vendorList = document.querySelector("#cpe_vendor_suggestions");
+    const productList = document.querySelector("#cpe_product_suggestions");
+    const versionList = document.querySelector("#cpe_version_suggestions");
     let catalog = {cpe_catalog_json};
+    let suggestTimer = null;
+    let suggestAbortController = null;
 
     const normalize = (value) => (value || "").trim().toLowerCase();
+    const setDataList = (target, items) => {{
+      if (!target) return;
+      target.innerHTML = (items || []).map((item) => `<option value="${{item}}"></option>`).join("");
+    }};
+    const fetchSuggest = async () => {{
+      const vendor = normalize(vendorInput?.value);
+      const product = normalize(productInput?.value);
+      const version = normalize(versionInput?.value);
+      const canFetch = (vendor.length >= 2) || (product.length >= 2) || (version.length >= 1 && vendor && product);
+      if (!canFetch) {{
+        setDataList(vendorList, []);
+        setDataList(productList, []);
+        setDataList(versionList, []);
+        return;
+      }}
+      if (suggestAbortController) {{
+        suggestAbortController.abort();
+      }}
+      suggestAbortController = new AbortController();
+      const params = new URLSearchParams();
+      if (vendor) params.set("vendor", vendor);
+      if (product) params.set("product", product);
+      if (version) params.set("version", version);
+      params.set("limit", "10");
+      try {{
+        const response = await fetch("/api/cpe/suggest?" + params.toString(), {{
+          method: "GET",
+          signal: suggestAbortController.signal,
+          headers: {{ "Accept": "application/json" }},
+        }});
+        if (!response.ok) {{
+          return;
+        }}
+        const data = await response.json();
+        setDataList(vendorList, data?.vendors || []);
+        setDataList(productList, data?.products || []);
+        setDataList(versionList, data?.versions || []);
+      }} catch (_) {{
+        // Ignore aborted or transient suggestion errors.
+      }}
+    }};
+    const queueSuggest = () => {{
+      if (suggestTimer) {{
+        clearTimeout(suggestTimer);
+      }}
+      suggestTimer = setTimeout(fetchSuggest, 220);
+    }};
     const rebuildHidden = () => {{
       if (hiddenInput) {{
         hiddenInput.value = catalog.join("\\n");
@@ -1106,12 +1248,37 @@ def settings_page() -> str | object:
       if (versionInput) versionInput.value = "";
       render();
     }});
+    vendorInput?.addEventListener("input", queueSuggest);
+    productInput?.addEventListener("input", queueSuggest);
+    versionInput?.addEventListener("input", queueSuggest);
+    vendorInput?.addEventListener("focus", queueSuggest);
+    productInput?.addEventListener("focus", queueSuggest);
+    versionInput?.addEventListener("focus", queueSuggest);
 
     render();
   }})();
 </script>
 </html>
 """
+
+
+@app.get("/api/cpe/suggest")
+def api_cpe_suggest() -> object:
+    vendor = (request.args.get("vendor") or "").strip()
+    product = (request.args.get("product") or "").strip()
+    version = (request.args.get("version") or "").strip()
+    limit_raw = (request.args.get("limit") or "10").strip()
+    try:
+        limit = int(limit_raw)
+    except ValueError:
+        limit = 10
+    limit = max(1, min(limit, 20))
+    try:
+        settings_obj = load_settings(".env")
+        data = fetch_cpe_autocomplete_suggestions(settings_obj, vendor, product, version, max_items=limit)
+        return jsonify(data)
+    except Exception as exc:  # pragma: no cover
+        return jsonify({"vendors": [], "products": [], "versions": [], "error": str(exc)}), 500
 
 
 @app.get("/")
