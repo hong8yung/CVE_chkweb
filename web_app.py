@@ -73,6 +73,43 @@ def parse_datetime_local(raw_value: str) -> datetime | None:
     return datetime.fromisoformat(value)
 
 
+def _compose_datetime_arg(param_name: str) -> str:
+    date_raw = (request.args.get(f"{param_name}_date") or "").strip()
+    time_raw = (request.args.get(f"{param_name}_time") or "").strip()
+    raw_value = (request.args.get(param_name) or "").strip()
+
+    # If date/time split inputs are present, they take precedence over legacy raw param.
+    if date_raw or time_raw:
+        if not date_raw:
+            return raw_value
+        if not time_raw:
+            return date_raw
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})", time_raw)
+        if not match:
+            return f"{date_raw}T{time_raw}"
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if hour > 23 or minute > 59:
+            return f"{date_raw}T{time_raw}"
+        return f"{date_raw}T{hour:02d}:{minute:02d}"
+
+    return raw_value
+
+
+def _split_datetime_for_inputs(raw_value: str) -> tuple[str, str]:
+    value = raw_value.strip()
+    if not value:
+        return "", ""
+    try:
+        parsed = datetime.fromisoformat(value)
+        return parsed.strftime("%Y-%m-%d"), parsed.strftime("%H:%M")
+    except ValueError:
+        if "T" in value:
+            date_part, time_part = value.split("T", 1)
+            return date_part, time_part[:5]
+        return value[:10], ""
+
+
 def format_cvss_badge(score: object) -> tuple[str, str]:
     if score is None:
         return ("None 0.0", "cvss-none")
@@ -138,8 +175,8 @@ def export_xlsx() -> object:
     product = (request.args.get("product") or "").strip()
     vendor = (request.args.get("vendor") or "").strip()
     keyword = (request.args.get("keyword") or "").strip()
-    last_modified_start_raw = (request.args.get("last_modified_start") or "").strip()
-    last_modified_end_raw = (request.args.get("last_modified_end") or "").strip()
+    last_modified_start_raw = _compose_datetime_arg("last_modified_start")
+    last_modified_end_raw = _compose_datetime_arg("last_modified_end")
     cpe_missing_only = request.args.get("cpe_missing_only") == "1"
     selected_impacts = [value.strip() for value in request.args.getlist("impact_type") if value.strip()]
     export_scope = (request.args.get("export_scope") or "page").strip().lower()
@@ -359,13 +396,22 @@ def index() -> str:
     product = (request.args.get("product") or "").strip()
     vendor = (request.args.get("vendor") or "").strip()
     keyword = (request.args.get("keyword") or "").strip()
-    user_supplied_last_modified = bool(request.args.get("last_modified_start") or request.args.get("last_modified_end"))
-    last_modified_start_raw = (request.args.get("last_modified_start") or "").strip()
-    last_modified_end_raw = (request.args.get("last_modified_end") or "").strip()
+    user_supplied_last_modified = bool(
+        request.args.get("last_modified_start")
+        or request.args.get("last_modified_end")
+        or request.args.get("last_modified_start_date")
+        or request.args.get("last_modified_start_time")
+        or request.args.get("last_modified_end_date")
+        or request.args.get("last_modified_end_time")
+    )
+    last_modified_start_raw = _compose_datetime_arg("last_modified_start")
+    last_modified_end_raw = _compose_datetime_arg("last_modified_end")
     if not last_modified_start_raw and not last_modified_end_raw:
         now_local = datetime.now().replace(second=0, microsecond=0)
         last_modified_end_raw = now_local.isoformat(timespec="minutes")
         last_modified_start_raw = (now_local - timedelta(days=7)).isoformat(timespec="minutes")
+    last_modified_start_date_raw, last_modified_start_time_raw = _split_datetime_for_inputs(last_modified_start_raw)
+    last_modified_end_date_raw, last_modified_end_time_raw = _split_datetime_for_inputs(last_modified_end_raw)
     cpe_missing_only = request.args.get("cpe_missing_only") == "1"
     selected_impacts = [value.strip() for value in request.args.getlist("impact_type") if value.strip()]
     no_filter_input = (
@@ -695,7 +741,7 @@ def index() -> str:
       box-shadow: var(--shadow);
       overflow: visible;
     }}
-    form {{
+    .panel > form {{
       padding: 16px;
       display: grid;
       grid-template-columns:
@@ -712,6 +758,15 @@ def index() -> str:
     }}
     .field-lastmod-start {{ grid-column: 1 / 2; }}
     .field-lastmod-end {{ grid-column: 2 / 3; }}
+    .datetime-parts {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 88px;
+      gap: 6px;
+    }}
+    .datetime-time {{
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+    }}
     .field-keyword {{ grid-column: 1 / 3; }}
     .field-vendor {{ grid-column: 3 / 5; }}
     .field-product {{ grid-column: 5 / 7; }}
@@ -901,7 +956,13 @@ def index() -> str:
       backdrop-filter: blur(2px);
     }}
     .export-dialog-body {{
+      display: block;
       padding: 18px;
+      border: 0;
+      background: transparent;
+      min-width: 0;
+      max-width: 100%;
+      overflow: visible;
     }}
     .export-dialog h3 {{
       margin: 0 0 8px;
@@ -919,7 +980,7 @@ def index() -> str:
       display: flex;
       gap: 8px;
       justify-content: flex-end;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
     }}
     .dialog-btn {{
       width: auto;
@@ -1132,7 +1193,7 @@ def index() -> str:
     @media (max-width: 900px) {{
       .wrap {{ width: min(1120px, 96vw); margin-top: 16px; }}
       .checkpoint-badge {{ width: 100%; margin-left: 0; text-align: left; }}
-      form {{ grid-template-columns: 1fr 1fr; }}
+      .panel > form {{ grid-template-columns: 1fr 1fr; }}
       .field-lastmod-start,
       .field-lastmod-end,
       .field-vendor,
@@ -1189,12 +1250,18 @@ def index() -> str:
     <section class="panel">
       <form method="get">
         <div class="field-lastmod-start">
-          <label for="last_modified_start">Last Modified Start</label>
-          <input id="last_modified_start" name="last_modified_start" type="text" inputmode="numeric" placeholder="YYYY-MM-DDTHH:MM" pattern="\\d{{4}}-\\d{{2}}-\\d{{2}}T\\d{{2}}:\\d{{2}}" title="YYYY-MM-DDTHH:MM (24-hour)" value="{escape(last_modified_start_raw)}">
+          <label for="last_modified_start_date">Last Modified Start</label>
+          <div class="datetime-parts">
+            <input id="last_modified_start_date" name="last_modified_start_date" type="date" value="{escape(last_modified_start_date_raw)}">
+            <input id="last_modified_start_time" name="last_modified_start_time" type="text" class="datetime-time" inputmode="numeric" placeholder="HH:MM" pattern="\\d{{1,2}}:\\d{{2}}" title="HH:MM (24-hour)" value="{escape(last_modified_start_time_raw)}">
+          </div>
         </div>
         <div class="field-lastmod-end">
-          <label for="last_modified_end">Last Modified End</label>
-          <input id="last_modified_end" name="last_modified_end" type="text" inputmode="numeric" placeholder="YYYY-MM-DDTHH:MM" pattern="\\d{{4}}-\\d{{2}}-\\d{{2}}T\\d{{2}}:\\d{{2}}" title="YYYY-MM-DDTHH:MM (24-hour)" value="{escape(last_modified_end_raw)}">
+          <label for="last_modified_end_date">Last Modified End</label>
+          <div class="datetime-parts">
+            <input id="last_modified_end_date" name="last_modified_end_date" type="date" value="{escape(last_modified_end_date_raw)}">
+            <input id="last_modified_end_time" name="last_modified_end_time" type="text" class="datetime-time" inputmode="numeric" placeholder="HH:MM" pattern="\\d{{1,2}}:\\d{{2}}" title="HH:MM (24-hour)" value="{escape(last_modified_end_time_raw)}">
+          </div>
         </div>
         <div class="field-cvss">
           <label for="min_cvss">Min CVSS</label>
