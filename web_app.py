@@ -3097,6 +3097,20 @@ def index() -> str:
       descDrawer.classList.remove("open");
       descDrawer.setAttribute("aria-hidden", "true");
     }});
+    document.addEventListener("click", (event) => {{
+      if (!descDrawer || !descDrawer.classList.contains("open")) {{
+        return;
+      }}
+      const target = event.target;
+      if (target.closest("#desc-drawer")) {{
+        return;
+      }}
+      if (target.closest(".view-btn")) {{
+        return;
+      }}
+      descDrawer.classList.remove("open");
+      descDrawer.setAttribute("aria-hidden", "true");
+    }});
     document.addEventListener("keydown", (event) => {{
       if (event.key === "Escape" && descDrawer?.classList.contains("open")) {{
         descDrawer.classList.remove("open");
@@ -3323,8 +3337,14 @@ def daily_review() -> str | object:
         elif current_status == "ignored":
             status_badge_class = "review-badge ignored"
             status_badge_text = "제외"
+        cpe_entries = row.get("cpe_entries") or []
+        cpe_badges = "".join(
+            f"<span class='cpe-chip'>{format_cpe_for_wrap(cpe_value)}</span>" for cpe_value in cpe_entries[:10]
+        )
+        if not cpe_badges:
+            cpe_badges = "<span class='cpe-chip'>-</span>"
         row_chunks.append(
-            "<tr>"
+            "<tr class='review-row'>"
             f"<td class='sticky-col sticky-left'><input type='checkbox' name='selected_cve_id' value='{cve_id}' form='bulk-form' class='bulk-cve-check'></td>"
             f"<td class='id'>{cve_id}</td>"
             f"<td class='score'><span class='cvss-chip {escape(score_class)}'>{escape(score_label)}</span></td>"
@@ -3332,6 +3352,7 @@ def daily_review() -> str | object:
             f"<td>{escape(format_last_modified(row.get('last_modified_at', 'N/A')))}</td>"
             f"<td>{escape(shorten(str(row.get('description', '')), 120))} "
             f"<button type='button' class='view-btn' data-cve='{cve_id}' data-desc='{escape(str(row.get('description', '')))}'>View</button></td>"
+            f"<td class='cpe'><div class='cpe-wrap'>{cpe_badges}</div></td>"
             f"<td>{escape(', '.join(matched_preset_map.get(cve_id_raw, [])) or '-')}</td>"
             f"<td class='sticky-col sticky-right {'row-highlight' if cve_id_raw == highlight_cve_id else ''}'>"
             f"<div class='{status_badge_class}'>{status_badge_text}</div>"
@@ -3355,7 +3376,7 @@ def daily_review() -> str | object:
             "</tr>"
         )
     if not row_chunks:
-        row_chunks.append("<tr><td colspan='8'>대상 없음</td></tr>")
+        row_chunks.append("<tr><td colspan='9'>대상 없음</td></tr>")
 
     info_lines = [
         f"기간: {period_label}",
@@ -3509,6 +3530,27 @@ def daily_review() -> str | object:
       font-weight: 700;
       cursor: pointer;
     }}
+    .cpe-wrap {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      min-width: 220px;
+      max-width: 320px;
+    }}
+    .cpe-chip {{
+      display: inline-flex;
+      align-items: center;
+      max-width: 100%;
+      border-radius: 999px;
+      border: 1px solid #dfd7ef;
+      background: #f8f4ff;
+      color: #4d3f6a;
+      font-size: 11px;
+      padding: 2px 8px;
+      line-height: 1.35;
+      white-space: normal;
+      word-break: break-all;
+    }}
     .desc-drawer {{
       position: fixed;
       top: 0;
@@ -3640,7 +3682,7 @@ def daily_review() -> str | object:
       <table>
         <thead>
           <tr>
-            <th class="sticky-col sticky-left"><input id="bulk-select-all" type="checkbox" title="전체 선택"></th><th>CVE ID</th><th>CVSS</th><th>Type</th><th>Last Modified</th><th>Description</th><th>Preset</th><th class="sticky-col sticky-right">Review</th>
+            <th class="sticky-col sticky-left"><input id="bulk-select-all" type="checkbox" title="전체 선택"></th><th>CVE ID</th><th>CVSS</th><th>Type</th><th>Last Modified</th><th>Description</th><th>CPE</th><th>Preset</th><th class="sticky-col sticky-right">Review</th>
           </tr>
         </thead>
         <tbody>
@@ -3662,6 +3704,7 @@ def daily_review() -> str | object:
   (() => {{
     const selectAll = document.querySelector("#bulk-select-all");
     const checks = () => Array.from(document.querySelectorAll(".bulk-cve-check"));
+    const reviewRows = Array.from(document.querySelectorAll("tr.review-row"));
     const viewButtons = Array.from(document.querySelectorAll(".view-btn"));
     const descDrawer = document.querySelector("#daily-desc-drawer");
     const descDrawerBody = document.querySelector("#daily-desc-drawer-body");
@@ -3678,6 +3721,27 @@ def daily_review() -> str | object:
         const all = checks();
         if (!all.length || !selectAll) return;
         selectAll.checked = all.every((x) => x.checked);
+      }});
+    }});
+    reviewRows.forEach((row) => {{
+      row.addEventListener("click", (event) => {{
+        const target = event.target;
+        if (
+          target.closest("button")
+          || target.closest("a")
+          || target.closest("input")
+          || target.closest("select")
+          || target.closest("label")
+          || target.closest("textarea")
+        ) {{
+          return;
+        }}
+        const checkbox = row.querySelector(".bulk-cve-check");
+        if (!checkbox) {{
+          return;
+        }}
+        checkbox.checked = !checkbox.checked;
+        checkbox.dispatchEvent(new Event("change", {{ bubbles: true }}));
       }});
     }});
     const bulkForm = document.querySelector("#bulk-form");
@@ -3732,6 +3796,20 @@ def daily_review() -> str | object:
     }});
     descDrawerClose?.addEventListener("click", () => {{
       if (!descDrawer) return;
+      descDrawer.classList.remove("open");
+      descDrawer.setAttribute("aria-hidden", "true");
+    }});
+    document.addEventListener("click", (event) => {{
+      if (!descDrawer || !descDrawer.classList.contains("open")) {{
+        return;
+      }}
+      const target = event.target;
+      if (target.closest("#daily-desc-drawer")) {{
+        return;
+      }}
+      if (target.closest(".view-btn")) {{
+        return;
+      }}
       descDrawer.classList.remove("open");
       descDrawer.setAttribute("aria-hidden", "true");
     }});
@@ -3863,7 +3941,7 @@ def daily_export_xlsx() -> object:
     sheet.append(["Window Days", str(window_days)])
     sheet.append(["Status Filter", status_filter])
     sheet.append([])
-    headers = ["CVE ID", "CVSS", "Type", "Last Modified", "Description", "Preset", "Review Status", "Review Note"]
+    headers = ["CVE ID", "CVSS", "Type", "Last Modified", "Description", "CPE", "Preset", "Review Status", "Review Note"]
     sheet.append(headers)
 
     header_row = sheet.max_row
@@ -3886,6 +3964,7 @@ def daily_export_xlsx() -> object:
                 str(row.get("vuln_type", "Other")),
                 format_last_modified(row.get("last_modified_at", "N/A")),
                 str(row.get("description", "")),
+                "\n".join(str(cpe) for cpe in (row.get("cpe_entries") or [])),
                 ", ".join(matched_preset_map.get(cve_id, [])),
                 row_status,
                 str(state.get("note", "")),
@@ -3897,13 +3976,15 @@ def daily_export_xlsx() -> object:
     sheet.column_dimensions["C"].width = 24
     sheet.column_dimensions["D"].width = 24
     sheet.column_dimensions["E"].width = 90
-    sheet.column_dimensions["F"].width = 34
-    sheet.column_dimensions["G"].width = 14
-    sheet.column_dimensions["H"].width = 42
+    sheet.column_dimensions["F"].width = 42
+    sheet.column_dimensions["G"].width = 34
+    sheet.column_dimensions["H"].width = 14
+    sheet.column_dimensions["I"].width = 42
 
     for row_idx in range(header_row + 1, sheet.max_row + 1):
         sheet.cell(row=row_idx, column=5).alignment = Alignment(vertical="top", wrap_text=True)
-        sheet.cell(row=row_idx, column=8).alignment = Alignment(vertical="top", wrap_text=True)
+        sheet.cell(row=row_idx, column=6).alignment = Alignment(vertical="top", wrap_text=True)
+        sheet.cell(row=row_idx, column=9).alignment = Alignment(vertical="top", wrap_text=True)
 
     output = BytesIO()
     workbook.save(output)
