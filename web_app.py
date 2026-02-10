@@ -3343,14 +3343,20 @@ def daily_review() -> str | object:
         )
         if not cpe_badges:
             cpe_badges = "<span class='cpe-chip'>-</span>"
+        last_modified_text = format_last_modified(row.get("last_modified_at", "N/A"))
+        last_modified_parts = last_modified_text.split(" ", 1)
+        if len(last_modified_parts) == 2:
+            last_modified_html = f"{escape(last_modified_parts[0])}<br>{escape(last_modified_parts[1])}"
+        else:
+            last_modified_html = escape(last_modified_text)
         row_chunks.append(
             "<tr class='review-row'>"
             f"<td class='sticky-col sticky-left'><input type='checkbox' name='selected_cve_id' value='{cve_id}' form='bulk-form' class='bulk-cve-check'></td>"
             f"<td class='id'>{cve_id}</td>"
             f"<td class='score'><span class='cvss-chip {escape(score_class)}'>{escape(score_label)}</span></td>"
             f"<td>{escape(str(row.get('vuln_type', 'Other')))}</td>"
-            f"<td>{escape(format_last_modified(row.get('last_modified_at', 'N/A')))}</td>"
-            f"<td>{escape(shorten(str(row.get('description', '')), 120))} "
+            f"<td class='last-mod'>{last_modified_html}</td>"
+            f"<td class='desc'>{escape(shorten(str(row.get('description', '')), 120))} "
             f"<button type='button' class='view-btn' data-cve='{cve_id}' data-desc='{escape(str(row.get('description', '')))}'>View</button></td>"
             f"<td class='cpe'><div class='cpe-wrap'>{cpe_badges}</div></td>"
             f"<td>{escape(', '.join(matched_preset_map.get(cve_id_raw, [])) or '-')}</td>"
@@ -3479,8 +3485,10 @@ def daily_review() -> str | object:
     .ok-msg {{ color:#0c6d57; font-size:13px; font-weight:700; margin: 4px 0; }}
     .error-msg {{ color:#ad3427; font-size:13px; font-weight:700; margin: 4px 0; }}
     table {{ width:100%; border-collapse: collapse; }}
-    th, td {{ border-top:1px solid var(--line); padding:8px 10px; vertical-align:top; font-size:13px; }}
-    th {{ text-align:left; color:var(--muted); font-size:12px; text-transform:uppercase; }}
+    th, td {{ border-top:1px solid var(--line); padding:8px 10px; vertical-align:middle; text-align:center; font-size:13px; }}
+    th {{ text-align:center; color:var(--muted); font-size:12px; text-transform:uppercase; }}
+    td.last-mod, td.desc {{ text-align:left; vertical-align:top; }}
+    td.last-mod {{ white-space:normal; line-height:1.35; min-width:120px; }}
     .id {{ white-space:nowrap; font-weight:700; }}
     .review-form {{ display:grid; grid-template-columns: 120px 1fr auto; gap:6px; }}
     .review-form select,.review-form input,.review-form button {{ border:1px solid var(--line); border-radius:7px; padding:6px 8px; font:inherit; }}
@@ -3524,10 +3532,11 @@ def daily_review() -> str | object:
     .review-row.row-selected .sticky-col {{
       background: #e5f2ec;
     }}
-    .review-row.row-active td {{
-      box-shadow: inset 0 0 0 2px rgba(29, 87, 79, 0.52);
-    }}
     .review-row.row-active {{
+      position: relative;
+      z-index: 2;
+      outline: 2px solid rgba(29, 87, 79, 0.68);
+      outline-offset: -2px;
       animation: activeRowGlow 1.2s ease-in-out infinite alternate;
     }}
     .view-btn {{
@@ -3545,6 +3554,8 @@ def daily_review() -> str | object:
     .cpe-wrap {{
       display: flex;
       flex-wrap: wrap;
+      justify-content: center;
+      align-items: center;
       gap: 4px;
       min-width: 220px;
       max-width: 320px;
@@ -3730,8 +3741,8 @@ def daily_review() -> str | object:
     let selectionAnchorIndex = -1;
     const isTypingTarget = (target) => {{
       if (!target || !(target instanceof Element)) return false;
-      if (target.closest("#daily-desc-drawer")) return true;
-      if (target.closest("input, select, textarea, button, a")) return true;
+      if (target.closest("input, select, textarea")) return true;
+      if (target.closest("#daily-desc-drawer")) return false;
       return !!target.isContentEditable;
     }};
     const setActiveRow = (index, focusRow = false, setAnchor = false) => {{
