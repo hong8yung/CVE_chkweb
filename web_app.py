@@ -14,8 +14,25 @@ from settings import load_settings
 app = Flask(__name__)
 
 
-def to_score_text(score: object) -> str:
-    return "N/A" if score is None else str(score)
+def format_cvss_badge(score: object) -> tuple[str, str]:
+    if score is None:
+        return ("None 0.0", "cvss-none")
+
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return ("None 0.0", "cvss-none")
+
+    value = max(0.0, min(value, 10.0))
+    if value == 0.0:
+        return (f"None {value:.1f}", "cvss-none")
+    if value <= 3.9:
+        return (f"Low {value:.1f}", "cvss-low")
+    if value <= 6.9:
+        return (f"Medium {value:.1f}", "cvss-medium")
+    if value <= 8.9:
+        return (f"High {value:.1f}", "cvss-high")
+    return (f"Critical {value:.1f}", "cvss-critical")
 
 
 def shorten(text: str, limit: int = 130) -> str:
@@ -132,7 +149,8 @@ def index() -> str:
     row_chunks: list[str] = []
     for row in rows:
         cve_id = escape(str(row.get("id", "UNKNOWN")))
-        score_text = escape(to_score_text(row.get("cvss_score")))
+        score_label, score_class = format_cvss_badge(row.get("cvss_score"))
+        score_text = escape(score_label)
         vuln_type = escape(str(row.get("vuln_type", "Other")))
         last_modified = escape(format_last_modified(row.get("last_modified_at", "N/A")))
         description = str(row.get("description", ""))
@@ -149,7 +167,7 @@ def index() -> str:
         row_chunks.append(
             "<tr>"
             f"<td class='id'>{cve_id}</td>"
-            f"<td class='score'>{score_text}</td>"
+            f"<td class='score'><span class='cvss-chip {escape(score_class)}'>{score_text}</span></td>"
             f"<td class='lastmod'>{last_modified}</td>"
             f"<td class='vtype'>{vuln_type}</td>"
             "<td class='desc'>"
@@ -489,7 +507,8 @@ def index() -> str:
       position: sticky;
       top: 0;
       background: #f2eee4;
-      text-align: left;
+      text-align: center;
+      vertical-align: middle;
       font-size: 12px;
       letter-spacing: 0.4px;
       text-transform: uppercase;
@@ -500,7 +519,9 @@ def index() -> str:
       text-decoration: none;
       display: inline-flex;
       align-items: center;
+      justify-content: center;
       gap: 5px;
+      width: 100%;
     }}
     thead th a:hover {{ color: #1e5a53; }}
     .sort-mark {{ font-size: 11px; opacity: 0.9; }}
@@ -514,6 +535,46 @@ def index() -> str:
     .id {{ width: 190px; white-space: nowrap; font-weight: 700; color: #123a44; }}
     .score {{ width: 92px; white-space: nowrap; }}
     .actions {{ width: 120px; white-space: nowrap; }}
+    .cvss-chip {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 84px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      border: 1px solid transparent;
+    }}
+    .cvss-critical {{
+      color: #9f1f1f;
+      background: #fde8e8;
+      border-color: #efb6b6;
+    }}
+    .cvss-high {{
+      color: #9a4a00;
+      background: #fff1e4;
+      border-color: #f0c79c;
+    }}
+    .cvss-medium {{
+      color: #7b6400;
+      background: #fff8d8;
+      border-color: #ead88a;
+    }}
+    .cvss-low {{
+      color: #4b4f55;
+      background: #eef0f3;
+      border-color: #d3d8de;
+    }}
+    .cvss-none {{
+      color: #8f98a3;
+      background: #1b1f24;
+      border-color: #2f3842;
+    }}
+    td.cpe, td.actions {{
+      vertical-align: middle;
+      text-align: left;
+    }}
     .copy-btn {{
       width: auto;
       font-size: 11px;
@@ -532,11 +593,22 @@ def index() -> str:
       color: #2d4658;
     }}
     .copy-btn:hover {{ filter: brightness(0.98); }}
-    .desc details {{ cursor: pointer; position: relative; }}
+    .desc {{
+      position: relative;
+      overflow: visible;
+    }}
+    .desc details {{ cursor: pointer; position: relative; overflow: visible; }}
     .desc summary {{ color: #334b53; font-weight: 500; }}
     .desc summary:hover {{ color: #0f6f65; }}
+    .desc details[open] summary {{
+      color: #0c645b;
+    }}
     .detail-body {{
-      margin-top: 8px;
+      position: absolute;
+      top: calc(100% + 8px);
+      left: 0;
+      z-index: 80;
+      margin-top: 0;
       padding: 10px;
       border-radius: 8px;
       border: 1px solid var(--line);
@@ -545,9 +617,17 @@ def index() -> str:
       width: min(920px, 82vw);
       min-width: 520px;
       max-width: 100%;
+      max-height: 420px;
+      overflow: auto;
       box-shadow: 0 10px 22px rgba(30, 43, 49, 0.12);
     }}
-    .cpe-wrap {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+    .cpe-wrap {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      justify-content: flex-start;
+    }}
     .cpe-chip {{
       display: inline-block;
       border: 1px solid #cfddd9;
@@ -579,8 +659,11 @@ def index() -> str:
       .actions-bar {{ grid-column: 1 / -1; justify-content: flex-start; }}
       .impact-list {{ width: min(92vw, 360px); }}
       .detail-body {{
+        position: static;
         width: 100%;
         min-width: 0;
+        max-height: none;
+        margin-top: 8px;
       }}
       table, thead, tbody, th, td, tr {{ display: block; }}
       thead {{ display: none; }}

@@ -61,12 +61,15 @@ python3 nvd_fetch.py --vendor ivanti --min-cvss 7.0
 python3 nvd_fetch.py --product endpoint_manager_mobile --min-cvss 7.0
 python3 nvd_fetch.py --vendor nginx --product nginx --min-cvss 7.0 --limit 20
 python3 nvd_fetch.py --vendor ivanti --impact-type "Remote Code Execution" --min-cvss 7.0
+python3 nvd_fetch.py --cpe-missing-only --sort-by last_modified --sort-order desc --limit 30
 ```
 
 조건 규칙:
 - `vendor`와 `product`를 모두 입력하면 AND 조건으로 검색
 - 둘 중 하나만 입력하면 해당 단일 조건으로 검색
+- `vendor`/`product` 없이도 검색 가능(전체 대상)
 - 검색은 `ILIKE` 기반이라 대소문자 구분 없이 동작 (`Ivanti`, `ivanti` 동일)
+- `--cpe-missing-only`를 사용하면 vulnerable CPE 매핑이 없는 CVE만 조회
 
 ## 6) 유틸리티 (기존 raw로 CPE 백필)
 
@@ -84,10 +87,27 @@ pip install -r requirements.txt
 python3 web_app.py --host 0.0.0.0 --port 8888
 ```
 
-브라우저에서 `http://<server-ip>:8888` 접속 후 `vendor`, `product`, `min_cvss`, `limit`으로 조회할 수 있습니다.
-`Impact Type`은 다중 선택(복수 선택)으로 필터링할 수 있습니다.
-정렬은 테이블 헤더 `CVSS`, `Last Modified` 클릭으로 토글됩니다.
-`Reset Filters`, `Share URL`, 행별 `Copy CVE`/`Copy CPE` 버튼을 지원합니다.
+브라우저에서 `http://<server-ip>:8888` 접속 후 조회할 수 있습니다.
+초기 화면(필터 미입력)은 최신 `Last Modified` 순으로 자동 조회됩니다.
+
+지원 필터:
+- `Last Modified Start/End` (날짜+시간 범위)
+- `vendor`, `product`, `min_cvss`, `Impact Type`(다중 선택), `limit`
+- `CPE missing only` (vulnerable CPE가 없는 CVE만)
+
+표시/동작:
+- `CVSS`는 등급+점수 칩으로 표시 (`None/Low/Medium/High/Critical`)
+- 정렬은 테이블 헤더 `CVSS`, `Last Modified` 클릭으로 토글
+- Description 상세는 오버레이로 표시(테이블 폭 고정)
+- `Reset Filters`, `Share URL`, 행별 `Copy CVE`/`Copy CPE` 버튼 지원
+
+개발 중 재시작 스크립트:
+```bash
+./dev_web.sh start --reload
+./dev_web.sh restart --reload
+./dev_web.sh stop
+./dev_web.sh status
+```
 
 ## 동작 원칙
 
