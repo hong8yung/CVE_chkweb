@@ -4,11 +4,14 @@ import argparse
 import math
 import re
 import time
+from io import BytesIO
 from datetime import datetime
 from html import escape
 from urllib.parse import urlencode
 
-from flask import Flask, request
+from flask import Flask, request, send_file
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 
 from classification import IMPACT_TYPE_OPTIONS
 from nvd_fetch import fetch_cves_from_db
@@ -61,6 +64,13 @@ def _set_cached_count(key: str, value: int) -> None:
         oldest_key = min(_count_cache.items(), key=lambda item: item[1][1])[0]
         _count_cache.pop(oldest_key, None)
     _count_cache[key] = (value, time.time())
+
+
+def parse_datetime_local(raw_value: str) -> datetime | None:
+    value = raw_value.strip()
+    if not value:
+        return None
+    return datetime.fromisoformat(value)
 
 
 def format_cvss_badge(score: object) -> tuple[str, str]:
@@ -120,6 +130,227 @@ def format_last_modified(value: object) -> str:
             tz_text = f"UTC{sign}{hours:02d}:{minutes:02d}"
         return f"{base} {tz_text}"
     return str(value)
+
+
+@app.get("/export.xlsx")
+def export_xlsx() -> object:
+    sort_key_param = request.args.get("sort_key")
+    product = (request.args.get("product") or "").strip()
+    vendor = (request.args.get("vendor") or "").strip()
+    keyword = (request.args.get("keyword") or "").strip()
+    last_modified_start_raw = (request.args.get("last_modified_start") or "").strip()
+    last_modified_end_raw = (request.args.get("last_modified_end") or "").strip()
+    cpe_missing_only = request.args.get("cpe_missing_only") == "1"
+    selected_impacts = [value.strip() for value in request.args.getlist("impact_type") if value.strip()]
+    export_scope = (request.args.get("export_scope") or "page").strip().lower()
+    if export_scope not in {"page", "all"}:
+        export_scope = "page"
+
+    sort_map = {
+        "cvss_desc": ("cvss", "desc"),
+        "cvss_asc": ("cvss", "asc"),
+        "last_modified_desc": ("last_modified", "desc"),
+        "last_modified_asc": ("last_modified", "asc"),
+    }
+
+    min_cvss_raw = (request.args.get("min_cvss") or "0").strip()
+    limit_raw = (request.args.get("limit") or "50").strip()
+    page_raw = (request.args.get("page") or "1").strip()
+
+    try:
+        min_cvss = float(min_cvss_raw)
+    except ValueError:
+        min_cvss = 0.0
+
+    try:
+        limit = int(limit_raw)
+    except ValueError:
+        limit = 50
+    limit = max(1, min(limit, 500))
+
+    try:
+        page = int(page_raw)
+    except ValueError:
+        page = 1
+    page = max(1, page)
+
+    sort_key = (sort_key_param or "cvss_desc").strip()
+    sort_by, sort_order = sort_map.get(sort_key, ("cvss", "desc"))
+
+    try:
+        last_modified_start = parse_datetime_local(last_modified_start_raw)
+        last_modified_end = parse_datetime_local(last_modified_end_raw)
+    except ValueError:
+        return "Invalid Last Modified datetime. Use format YYYY-MM-DDTHH:MM.", 400
+    if (
+        last_modified_start is not None
+        and last_modified_end is not None
+        and last_modified_start > last_modified_end
+    ):
+        return "Last Modified Start must be earlier than or equal to End.", 400
+
+    settings = load_settings(".env")
+    count_cache_key = _build_count_cache_key(
+        product,
+        vendor,
+        keyword,
+        selected_impacts,
+        min_cvss,
+        last_modified_start_raw,
+        last_modified_end_raw,
+        cpe_missing_only,
+    )
+
+    rows: list[dict[str, object]] = []
+    total_count = _get_cached_count(count_cache_key)
+    if export_scope == "page":
+        rows, _ = fetch_cves_from_db(
+            settings,
+            product,
+            vendor or None,
+            keyword or None,
+            selected_impacts or None,
+            min_cvss,
+            limit,
+            offset=(page - 1) * limit,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            last_modified_start=last_modified_start,
+            last_modified_end=last_modified_end,
+            cpe_missing_only=cpe_missing_only,
+            include_total_count=False,
+        )
+    else:
+        batch_size = 1000
+        offset = 0
+        while True:
+            batch_rows, batch_total = fetch_cves_from_db(
+                settings,
+                product,
+                vendor or None,
+                keyword or None,
+                selected_impacts or None,
+                min_cvss,
+                batch_size,
+                offset=offset,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                last_modified_start=last_modified_start,
+                last_modified_end=last_modified_end,
+                cpe_missing_only=cpe_missing_only,
+                include_total_count=(total_count is None and offset == 0),
+            )
+            if batch_total is not None:
+                total_count = batch_total
+                _set_cached_count(count_cache_key, batch_total)
+            if not batch_rows:
+                break
+            rows.extend(batch_rows)
+            offset += len(batch_rows)
+            if total_count is not None and offset >= total_count:
+                break
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "CVE Results"
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    filter_summary_parts: list[str] = []
+    if keyword:
+        filter_summary_parts.append(f"keyword={keyword}")
+    if vendor:
+        filter_summary_parts.append(f"vendor={vendor}")
+    if product:
+        filter_summary_parts.append(f"product={product}")
+    if selected_impacts:
+        filter_summary_parts.append(f"impact_type={', '.join(selected_impacts)}")
+    if last_modified_start_raw:
+        filter_summary_parts.append(f"last_modified_start={last_modified_start_raw}")
+    if last_modified_end_raw:
+        filter_summary_parts.append(f"last_modified_end={last_modified_end_raw}")
+    if cpe_missing_only:
+        filter_summary_parts.append("cpe_missing_only=1")
+    filter_summary_parts.append(f"min_cvss={min_cvss}")
+    filter_summary_parts.append(f"limit={limit}")
+    filter_summary_parts.append(f"sort={sort_key}")
+    filter_summary_parts.append(f"export_scope={export_scope}")
+    filter_summary = "; ".join(filter_summary_parts)
+
+    sheet.append(["Search Time", generated_at])
+    sheet.append(["Filter Summary", filter_summary])
+    sheet.append([])
+
+    headers = [
+        "CVE ID",
+        "CVSS Severity",
+        "CVSS Score",
+        "Impact Type",
+        "Last Modified",
+        "Description",
+        "CPE Entries",
+    ]
+    sheet.append(headers)
+    meta_label_fill = PatternFill(fill_type="solid", start_color="E8F1EF", end_color="E8F1EF")
+    header_fill = PatternFill(fill_type="solid", start_color="F2EEE4", end_color="F2EEE4")
+    sheet["A1"].font = Font(bold=True, color="0F6F65")
+    sheet["A2"].font = Font(bold=True, color="0F6F65")
+    sheet["A1"].fill = meta_label_fill
+    sheet["A2"].fill = meta_label_fill
+    sheet["B1"].alignment = Alignment(horizontal="left")
+    sheet["B2"].alignment = Alignment(horizontal="left", wrap_text=True)
+
+    header_row = 4
+    for col in range(1, len(headers) + 1):
+        cell = sheet.cell(row=header_row, column=col)
+        cell.font = Font(bold=True, color="2F3F45")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for row in rows:
+        severity_label, _ = format_cvss_badge(row.get("cvss_score"))
+        severity = severity_label.split(" ", 1)[0]
+        score_value = row.get("cvss_score")
+        score_text = "0.0" if score_value is None else str(score_value)
+        cpe_entries = row.get("cpe_entries") or []
+        sheet.append(
+            [
+                str(row.get("id", "UNKNOWN")),
+                severity,
+                score_text,
+                str(row.get("vuln_type", "Other")),
+                format_last_modified(row.get("last_modified_at", "N/A")),
+                str(row.get("description", "")),
+                "\n".join(str(cpe) for cpe in cpe_entries) if cpe_entries else "",
+            ]
+        )
+
+    sheet.column_dimensions["A"].width = 20
+    sheet.column_dimensions["B"].width = 14
+    sheet.column_dimensions["C"].width = 10
+    sheet.column_dimensions["D"].width = 28
+    sheet.column_dimensions["E"].width = 24
+    sheet.column_dimensions["F"].width = 90
+    sheet.column_dimensions["G"].width = 70
+
+    for row_idx in range(5, sheet.max_row + 1):
+        sheet.cell(row=row_idx, column=6).alignment = Alignment(vertical="top", wrap_text=True)
+        sheet.cell(row=row_idx, column=7).alignment = Alignment(vertical="top", wrap_text=True)
+        sheet.cell(row=row_idx, column=1).alignment = Alignment(vertical="top")
+        sheet.cell(row=row_idx, column=2).alignment = Alignment(horizontal="center", vertical="top")
+        sheet.cell(row=row_idx, column=3).alignment = Alignment(horizontal="center", vertical="top")
+        sheet.cell(row=row_idx, column=4).alignment = Alignment(vertical="top")
+        sheet.cell(row=row_idx, column=5).alignment = Alignment(vertical="top")
+
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    scope_text = "all" if export_scope == "all" else f"page{page}"
+    filename = f"cve_export_{scope_text}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @app.get("/")
@@ -916,6 +1147,7 @@ def index() -> str:
         <input type="hidden" name="sort_key" value="{escape(sort_key)}">
         <div class="actions-bar">
           <a class="secondary-btn" href="/">Reset Filters</a>
+          <button id="export-xlsx-btn" type="button" class="secondary-btn">Export Excel</button>
           <button id="share-url-btn" type="button" class="secondary-btn">Share URL</button>
         </div>
       </form>
@@ -946,6 +1178,7 @@ def index() -> str:
     const form = document.querySelector("form");
     const impactDetails = document.querySelector(".impact-details");
     const shareButton = document.querySelector("#share-url-btn");
+    const exportButton = document.querySelector("#export-xlsx-btn");
     const copyButtons = document.querySelectorAll(".copy-btn");
 
     if (impactDetails) {{
@@ -972,6 +1205,15 @@ def index() -> str:
         }} catch (_) {{
           window.prompt("Copy URL:", url);
         }}
+      }});
+    }}
+
+    if (exportButton) {{
+      exportButton.addEventListener("click", () => {{
+        const params = new URLSearchParams(window.location.search);
+        const exportAll = window.confirm("Export all filtered results?\nOK: All pages\nCancel: Current page only");
+        params.set("export_scope", exportAll ? "all" : "page");
+        window.location.href = `/export.xlsx?${{params.toString()}}`;
       }});
     }}
 
