@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 import time
 from datetime import datetime
 from html import escape
@@ -88,6 +89,18 @@ def shorten(text: str, limit: int = 130) -> str:
     if len(clean) <= limit:
         return clean
     return clean[: limit - 1] + "..."
+
+
+def format_cpe_for_wrap(value: object) -> str:
+    text = str(value)
+    tokens = re.split(r"([:/._-])", text)
+    chunks: list[str] = []
+    for token in tokens:
+        if token in {":", "/", ".", "_", "-"}:
+            chunks.append(f"{escape(token)}<wbr>")
+        else:
+            chunks.append(escape(token))
+    return "".join(chunks)
 
 
 def format_last_modified(value: object) -> str:
@@ -237,7 +250,7 @@ def index() -> str:
         full_description = escape(description)
         cpe_entries = row.get("cpe_entries") or []
         cpe_badges = "".join(
-            f"<span class='cpe-chip'>{escape(str(cpe_value))}</span>" for cpe_value in cpe_entries[:10]
+            f"<span class='cpe-chip'>{format_cpe_for_wrap(cpe_value)}</span>" for cpe_value in cpe_entries[:10]
         )
         if not cpe_badges:
             cpe_badges = "<span class='cpe-chip'>-</span>"
@@ -387,7 +400,7 @@ def index() -> str:
       min-height: 100vh;
     }}
     .wrap {{
-      width: min(1120px, 94vw);
+      width: min(1600px, 90vw);
       margin: 34px auto 54px;
       animation: rise 280ms ease-out;
     }}
@@ -793,8 +806,8 @@ def index() -> str:
       border-radius: 999px;
       font-size: 12px;
       white-space: normal;
-      overflow-wrap: anywhere;
-      word-break: break-word;
+      overflow-wrap: break-word;
+      word-break: normal;
       max-width: 100%;
     }}
     @keyframes rise {{
