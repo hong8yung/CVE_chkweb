@@ -63,3 +63,14 @@ CREATE TABLE IF NOT EXISTS user_profile_settings (
   settings_json jsonb NOT NULL,
   updated_at    timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS daily_review_item (
+  profile_key  text NOT NULL,
+  review_date  date NOT NULL,
+  cve_id       text NOT NULL REFERENCES cve (id) ON DELETE CASCADE,
+  status       text NOT NULL DEFAULT 'pending',
+  note         text NOT NULL DEFAULT '',
+  reviewed_at  timestamptz,
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (profile_key, review_date, cve_id)
+);

@@ -92,6 +92,7 @@ python3 web_app.py --host 0.0.0.0 --port 8888
 
 메뉴:
 - `검색(/)` 페이지: CVE 조회
+- `일일 검토(/daily)` 페이지: 프로필 규칙으로 전일/최근 24시간 대상 검토 및 상태 저장
 - `설정(/settings)` 페이지: `본사(hq)`/`재화(jaehwa)` 프로필별 기본 검색값 저장
 
 적용 우선순위:
@@ -103,6 +104,16 @@ python3 web_app.py --host 0.0.0.0 --port 8888
 - `min_cvss`, `Impact Type`(다중 선택), `limit`
 - `CPE Object`(설정 페이지에 등록한 `vendor:product[:version]` 목록을 on/off로 선택)
 - `CPE missing only` (vulnerable CPE가 없는 CVE만)
+
+일일 검토:
+- 프로필 저장 규칙(`vendor`, `product`, `keyword`, `Impact Type`, `CPE Object`, `min_cvss`) 기반으로 자동 조회
+- 기간 기준(`전일 마감`, `최근 24h`) + 기간(일) 선택 가능
+- 행별 검토 상태(`미검토/검토완료/제외`)와 메모 저장
+
+설정 페이지 CPE UX:
+- CPE 객체를 `vendor/product/version` 입력 후 추가
+- 등록 목록은 칩으로 표시되며 즉시 삭제 가능
+- `미리보기` 버튼으로 최근 N일 기준 예상 검토 대상 건수 확인
 
 표시/동작:
 - `CVSS`는 등급+점수 칩으로 표시 (`None/Low/Medium/High/Critical`)

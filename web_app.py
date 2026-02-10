@@ -38,8 +38,11 @@ DEFAULT_PROFILE_SETTINGS: dict[str, object] = {
     "cpe_missing_only": False,
     "sort_key": "cvss_desc",
     "last_modified_lookback_days": 7,
+    "daily_review_window_days": 1,
+    "daily_review_limit": 300,
 }
 _profile_settings_table_ready = False
+_review_status_table_ready = False
 
 
 def _normalize_user_profile(raw_value: str | None) -> str:
@@ -98,6 +101,14 @@ def _sanitize_profile_settings(raw_settings: dict[str, object] | None) -> dict[s
         clean["last_modified_lookback_days"] = max(1, min(int(raw_settings.get("last_modified_lookback_days", 7)), 365))
     except (TypeError, ValueError):
         clean["last_modified_lookback_days"] = 7
+    try:
+        clean["daily_review_window_days"] = max(1, min(int(raw_settings.get("daily_review_window_days", 1)), 30))
+    except (TypeError, ValueError):
+        clean["daily_review_window_days"] = 1
+    try:
+        clean["daily_review_limit"] = max(1, min(int(raw_settings.get("daily_review_limit", 300)), 1000))
+    except (TypeError, ValueError):
+        clean["daily_review_limit"] = 300
 
     clean["cpe_missing_only"] = _to_bool(raw_settings.get("cpe_missing_only", False))
 
@@ -150,6 +161,33 @@ def _ensure_profile_settings_table(settings_obj: Settings) -> None:
     _profile_settings_table_ready = True
 
 
+def _ensure_review_status_table(settings_obj: Settings) -> None:
+    global _review_status_table_ready
+    if _review_status_table_ready:
+        return
+    conn = _connect_db(settings_obj)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS daily_review_item (
+                      profile_key  text NOT NULL,
+                      review_date  date NOT NULL,
+                      cve_id       text NOT NULL REFERENCES cve (id) ON DELETE CASCADE,
+                      status       text NOT NULL DEFAULT 'pending',
+                      note         text NOT NULL DEFAULT '',
+                      reviewed_at  timestamptz,
+                      updated_at   timestamptz NOT NULL DEFAULT now(),
+                      PRIMARY KEY (profile_key, review_date, cve_id)
+                    )
+                    """
+                )
+    finally:
+        conn.close()
+    _review_status_table_ready = True
+
+
 def fetch_profile_settings(settings_obj: Settings, profile: str) -> dict[str, object]:
     normalized_profile = _normalize_user_profile(profile)
     _ensure_profile_settings_table(settings_obj)
@@ -198,6 +236,66 @@ def upsert_profile_settings(settings_obj: Settings, profile: str, payload: dict[
     finally:
         conn.close()
     return sanitized_payload
+
+
+def fetch_daily_review_map(
+    settings_obj: Settings,
+    profile: str,
+    review_date: str,
+) -> dict[str, dict[str, str]]:
+    _ensure_review_status_table(settings_obj)
+    normalized_profile = _normalize_user_profile(profile)
+    conn = _connect_db(settings_obj)
+    result: dict[str, dict[str, str]] = {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT cve_id, status, note
+                FROM daily_review_item
+                WHERE profile_key = %s
+                  AND review_date = %s::date
+                """,
+                (normalized_profile, review_date),
+            )
+            rows = cur.fetchall()
+        for cve_id, status, note in rows:
+            result[str(cve_id)] = {"status": str(status), "note": str(note or "")}
+    finally:
+        conn.close()
+    return result
+
+
+def upsert_daily_review_item(
+    settings_obj: Settings,
+    profile: str,
+    review_date: str,
+    cve_id: str,
+    status: str,
+    note: str,
+) -> None:
+    _ensure_review_status_table(settings_obj)
+    normalized_profile = _normalize_user_profile(profile)
+    status_value = status if status in {"pending", "reviewed", "ignored"} else "pending"
+    conn = _connect_db(settings_obj)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO daily_review_item (profile_key, review_date, cve_id, status, note, reviewed_at, updated_at)
+                    VALUES (%s, %s::date, %s, %s, %s, CASE WHEN %s = 'pending' THEN NULL ELSE now() END, now())
+                    ON CONFLICT (profile_key, review_date, cve_id)
+                    DO UPDATE SET
+                      status = EXCLUDED.status,
+                      note = EXCLUDED.note,
+                      reviewed_at = CASE WHEN EXCLUDED.status = 'pending' THEN NULL ELSE now() END,
+                      updated_at = now()
+                    """,
+                    (normalized_profile, review_date, cve_id, status_value, note[:500], status_value),
+                )
+    finally:
+        conn.close()
 
 
 def _build_count_cache_key(
@@ -352,6 +450,7 @@ def _build_menu_html(active_page: str, user_profile: str | None = None) -> str:
     return (
         "<nav class='top-menu'>"
         f"<a class='menu-link {'active' if active_page == 'search' else ''}' href='/{profile_query}'>검색</a>"
+        f"<a class='menu-link {'active' if active_page == 'daily' else ''}' href='/daily{profile_query}'>일일 검토</a>"
         f"<a class='menu-link {'active' if active_page == 'settings' else ''}' href='/settings{profile_query}'>설정</a>"
         "</nav>"
     )
@@ -590,6 +689,7 @@ def settings_page() -> str | object:
     save_error = ""
     saved_notice = request.args.get("saved") == "1"
     reset_notice = request.args.get("reset") == "1"
+    preview_notice = ""
 
     app_settings: Settings | None = None
     profile_settings = dict(DEFAULT_PROFILE_SETTINGS)
@@ -620,6 +720,8 @@ def settings_page() -> str | object:
             "limit": (request.form.get("limit") or "").strip(),
             "sort_key": (request.form.get("sort_key") or "").strip(),
             "last_modified_lookback_days": (request.form.get("last_modified_lookback_days") or "").strip(),
+            "daily_review_window_days": (request.form.get("daily_review_window_days") or "").strip(),
+            "daily_review_limit": (request.form.get("daily_review_limit") or "").strip(),
             "cpe_missing_only": request.form.get("cpe_missing_only") == "1",
             "impact_type": [value.strip() for value in request.form.getlist("impact_type") if value.strip()],
         }
@@ -634,6 +736,37 @@ def settings_page() -> str | object:
                 except Exception as exc:  # pragma: no cover
                     save_error = f"설정 저장 실패: {exc}"
                     profile_settings = _sanitize_profile_settings(payload)
+        elif action == "preview":
+            profile_settings = _sanitize_profile_settings(payload)
+            if app_settings is None:
+                save_error = "DB 연결 정보를 불러올 수 없어 미리보기를 실행할 수 없습니다."
+            else:
+                try:
+                    now_local = datetime.now().replace(second=0, microsecond=0)
+                    window_days = int(profile_settings["daily_review_window_days"])
+                    start_dt = now_local - timedelta(days=window_days)
+                    _, preview_total = fetch_cves_from_db(
+                        app_settings,
+                        str(profile_settings["product"]) or None,
+                        str(profile_settings["vendor"]) or None,
+                        str(profile_settings["keyword"]) or None,
+                        list(profile_settings["impact_type"]) or None,
+                        float(profile_settings["min_cvss"]),
+                        limit=1,
+                        offset=0,
+                        sort_by="last_modified",
+                        sort_order="desc",
+                        last_modified_start=start_dt,
+                        last_modified_end=now_local,
+                        cpe_missing_only=bool(profile_settings["cpe_missing_only"]),
+                        cpe_objects=list(profile_settings["cpe_objects_catalog"]) or None,
+                        include_total_count=True,
+                    )
+                    preview_notice = (
+                        f"미리보기: 최근 {window_days}일 기준 예상 대상 {int(preview_total or 0)}건"
+                    )
+                except Exception as exc:  # pragma: no cover
+                    save_error = f"미리보기 실패: {exc}"
 
     impact_options_html = "".join(
         "<label class='impact-option'>"
@@ -646,8 +779,10 @@ def settings_page() -> str | object:
 
     save_notice_html = "<p class='ok-msg'>저장되었습니다.</p>" if saved_notice and not save_error else ""
     reset_notice_html = "<p class='ok-msg'>기본값으로 복원되었습니다.</p>" if reset_notice and not save_error else ""
+    preview_notice_html = f"<p class='ok-msg'>{escape(preview_notice)}</p>" if preview_notice and not save_error else ""
     error_html = f"<p class='error-msg'>{escape(save_error)}</p>" if save_error else ""
     menu_html = _build_menu_html("settings", user_profile=user_profile)
+    cpe_catalog_json = json.dumps(profile_settings["cpe_objects_catalog"])
     return f"""
 <!doctype html>
 <html lang="ko">
@@ -842,6 +977,7 @@ def settings_page() -> str | object:
       </div>
       {save_notice_html}
       {reset_notice_html}
+      {preview_notice_html}
       {error_html}
       <form method="post">
         <input type="hidden" name="user_profile" value="{escape(user_profile)}">
@@ -858,8 +994,15 @@ def settings_page() -> str | object:
           <input id="keyword" name="keyword" value="{escape(str(profile_settings['keyword']))}" placeholder="e.g. ssl, auth bypass, rce">
         </div>
         <div class="full">
-          <label for="cpe_objects_catalog">CPE 객체 목록 (한 줄 1개, vendor:product[:version])</label>
-          <textarea id="cpe_objects_catalog" name="cpe_objects_catalog" rows="4" style="width:100%;border:1px solid var(--line);border-radius:10px;padding:10px 12px;font:inherit;background:#fff;">{escape(chr(10).join(profile_settings['cpe_objects_catalog']))}</textarea>
+          <label>CPE 객체 목록 (vendor:product[:version])</label>
+          <input type="hidden" id="cpe_objects_catalog" name="cpe_objects_catalog" value="{escape(chr(10).join(profile_settings['cpe_objects_catalog']))}">
+          <div class="impact-box" id="cpe-catalog-list" style="max-height:none;min-height:60px;"></div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;margin-top:8px;">
+            <input id="cpe_vendor" placeholder="vendor (e.g. ivanti)">
+            <input id="cpe_product" placeholder="product (e.g. pulse_connect_secure)">
+            <input id="cpe_version" placeholder="version (optional)">
+            <button class="btn" type="button" id="add-cpe-btn">추가</button>
+          </div>
         </div>
         <div>
           <label for="min_cvss">기본 Min CVSS</label>
@@ -882,6 +1025,14 @@ def settings_page() -> str | object:
           <label for="last_modified_lookback_days">기본 Last Modified 범위(일)</label>
           <input id="last_modified_lookback_days" name="last_modified_lookback_days" type="number" min="1" max="365" step="1" value="{escape(str(profile_settings['last_modified_lookback_days']))}">
         </div>
+        <div>
+          <label for="daily_review_window_days">일일 검토 기본 기간(일)</label>
+          <input id="daily_review_window_days" name="daily_review_window_days" type="number" min="1" max="30" step="1" value="{escape(str(profile_settings['daily_review_window_days']))}">
+        </div>
+        <div>
+          <label for="daily_review_limit">일일 검토 최대 건수</label>
+          <input id="daily_review_limit" name="daily_review_limit" type="number" min="1" max="1000" step="1" value="{escape(str(profile_settings['daily_review_limit']))}">
+        </div>
         <div class="checkbox-row">
           <input id="cpe_missing_only" name="cpe_missing_only" type="checkbox" value="1" {'checked' if profile_settings['cpe_missing_only'] else ''}>
           <label for="cpe_missing_only">기본 CPE missing only 사용</label>
@@ -895,12 +1046,70 @@ def settings_page() -> str | object:
         <div class="actions">
           <a class="btn" href="/?user_profile={escape(user_profile)}">검색으로 이동</a>
           <button class="btn" type="submit" name="action" value="reset">기본값 복원</button>
+          <button class="btn" type="submit" name="action" value="preview">미리보기</button>
           <button class="btn primary" type="submit">저장</button>
         </div>
       </form>
     </section>
   </main>
 </body>
+<script>
+  (() => {{
+    const hiddenInput = document.querySelector("#cpe_objects_catalog");
+    const listWrap = document.querySelector("#cpe-catalog-list");
+    const addBtn = document.querySelector("#add-cpe-btn");
+    const vendorInput = document.querySelector("#cpe_vendor");
+    const productInput = document.querySelector("#cpe_product");
+    const versionInput = document.querySelector("#cpe_version");
+    let catalog = {cpe_catalog_json};
+
+    const normalize = (value) => (value || "").trim().toLowerCase();
+    const rebuildHidden = () => {{
+      if (hiddenInput) {{
+        hiddenInput.value = catalog.join("\\n");
+      }}
+    }};
+    const render = () => {{
+      if (!listWrap) return;
+      if (!catalog.length) {{
+        listWrap.innerHTML = "<span class='impact-chip muted-chip'>등록된 CPE 객체가 없습니다.</span>";
+        rebuildHidden();
+        return;
+      }}
+      listWrap.innerHTML = catalog.map((item, idx) => {{
+        return `<span class="impact-chip">${{item}} <button type="button" data-cpe-idx="${{idx}}" style="margin-left:6px;border:0;background:transparent;cursor:pointer;color:#8a2f23;">x</button></span>`;
+      }}).join("");
+      listWrap.querySelectorAll("[data-cpe-idx]").forEach((btn) => {{
+        btn.addEventListener("click", () => {{
+          const idx = Number(btn.getAttribute("data-cpe-idx") || "-1");
+          if (idx < 0) return;
+          catalog = catalog.filter((_, i) => i !== idx);
+          render();
+        }});
+      }});
+      rebuildHidden();
+    }};
+
+    addBtn?.addEventListener("click", () => {{
+      const vendor = normalize(vendorInput?.value);
+      const product = normalize(productInput?.value);
+      const version = normalize(versionInput?.value);
+      if (!vendor || !product) {{
+        return;
+      }}
+      const cpe = version ? `${{vendor}}:${{product}}:${{version}}` : `${{vendor}}:${{product}}`;
+      if (!catalog.includes(cpe)) {{
+        catalog.push(cpe);
+      }}
+      if (vendorInput) vendorInput.value = "";
+      if (productInput) productInput.value = "";
+      if (versionInput) versionInput.value = "";
+      render();
+    }});
+
+    render();
+  }})();
+</script>
 </html>
 """
 
@@ -2190,6 +2399,222 @@ def index() -> str:
     }});
   }})();
 </script>
+</html>
+"""
+
+
+@app.route("/daily", methods=["GET", "POST"])
+def daily_review() -> str | object:
+    user_profile = _normalize_user_profile(request.values.get("user_profile"))
+    app_settings: Settings | None = None
+    profile_defaults = dict(DEFAULT_PROFILE_SETTINGS)
+    error_text = ""
+    notice_text = ""
+    try:
+        app_settings = load_settings(".env")
+        profile_defaults = fetch_profile_settings(app_settings, user_profile)
+    except Exception as exc:  # pragma: no cover
+        error_text = f"설정 로딩 실패: {exc}"
+
+    now_local = datetime.now().replace(second=0, microsecond=0)
+    window_days_raw = request.values.get("window_days") or str(profile_defaults["daily_review_window_days"])
+    try:
+        window_days = max(1, min(int(window_days_raw), 30))
+    except ValueError:
+        window_days = int(profile_defaults["daily_review_window_days"])
+    review_limit_raw = request.values.get("review_limit") or str(profile_defaults["daily_review_limit"])
+    try:
+        review_limit = max(1, min(int(review_limit_raw), 1000))
+    except ValueError:
+        review_limit = int(profile_defaults["daily_review_limit"])
+
+    period_mode = (request.values.get("period_mode") or "previous_day").strip().lower()
+    if period_mode not in {"previous_day", "last24h"}:
+        period_mode = "previous_day"
+
+    if period_mode == "previous_day":
+        end_dt = now_local.replace(hour=0, minute=0)
+        start_dt = end_dt - timedelta(days=window_days)
+        review_date = (end_dt - timedelta(days=1)).date().isoformat()
+        period_label = f"{start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')}"
+    else:
+        end_dt = now_local
+        start_dt = now_local - timedelta(hours=24 * window_days)
+        review_date = end_dt.date().isoformat()
+        period_label = f"{start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')}"
+
+    if request.method == "POST" and not error_text:
+        cve_id = (request.form.get("cve_id") or "").strip()
+        status = (request.form.get("status") or "pending").strip().lower()
+        note = (request.form.get("note") or "").strip()
+        if not cve_id:
+            error_text = "상태를 저장할 CVE ID가 없습니다."
+        else:
+            try:
+                upsert_daily_review_item(app_settings, user_profile, review_date, cve_id, status, note)
+                notice_text = f"{cve_id} 상태가 저장되었습니다."
+            except Exception as exc:  # pragma: no cover
+                error_text = f"상태 저장 실패: {exc}"
+
+    rows: list[dict[str, object]] = []
+    total_count = 0
+    review_map: dict[str, dict[str, str]] = {}
+    if not error_text:
+        try:
+            rows, total_count = fetch_cves_from_db(
+                app_settings,
+                str(profile_defaults["product"]) or None,
+                str(profile_defaults["vendor"]) or None,
+                str(profile_defaults["keyword"]) or None,
+                list(profile_defaults["impact_type"]) or None,
+                float(profile_defaults["min_cvss"]),
+                review_limit,
+                offset=0,
+                sort_by="last_modified",
+                sort_order="desc",
+                last_modified_start=start_dt,
+                last_modified_end=end_dt,
+                cpe_missing_only=bool(profile_defaults["cpe_missing_only"]),
+                cpe_objects=list(profile_defaults["cpe_objects_catalog"]) or None,
+                include_total_count=True,
+            )
+            review_map = fetch_daily_review_map(app_settings, user_profile, review_date)
+        except Exception as exc:  # pragma: no cover
+            error_text = str(exc)
+
+    status_summary = {"pending": 0, "reviewed": 0, "ignored": 0}
+    row_chunks: list[str] = []
+    for row in rows:
+        cve_id_raw = str(row.get("id", "UNKNOWN"))
+        cve_id = escape(cve_id_raw)
+        state = review_map.get(cve_id_raw, {"status": "pending", "note": ""})
+        current_status = state.get("status", "pending")
+        if current_status not in status_summary:
+            current_status = "pending"
+        status_summary[current_status] += 1
+        current_note = escape(state.get("note", ""))
+        score_label, score_class = format_cvss_badge(row.get("cvss_score"))
+        row_chunks.append(
+            "<tr>"
+            f"<td class='id'>{cve_id}</td>"
+            f"<td class='score'><span class='cvss-chip {escape(score_class)}'>{escape(score_label)}</span></td>"
+            f"<td>{escape(str(row.get('vuln_type', 'Other')))}</td>"
+            f"<td>{escape(format_last_modified(row.get('last_modified_at', 'N/A')))}</td>"
+            f"<td>{escape(shorten(str(row.get('description', '')), 120))}</td>"
+            "<td>"
+            "<form method='post' class='review-form'>"
+            f"<input type='hidden' name='user_profile' value='{escape(user_profile)}'>"
+            f"<input type='hidden' name='period_mode' value='{escape(period_mode)}'>"
+            f"<input type='hidden' name='window_days' value='{window_days}'>"
+            f"<input type='hidden' name='review_limit' value='{review_limit}'>"
+            f"<input type='hidden' name='cve_id' value='{cve_id}'>"
+            "<select name='status'>"
+            f"<option value='pending' {'selected' if current_status == 'pending' else ''}>미검토</option>"
+            f"<option value='reviewed' {'selected' if current_status == 'reviewed' else ''}>검토완료</option>"
+            f"<option value='ignored' {'selected' if current_status == 'ignored' else ''}>제외</option>"
+            "</select>"
+            f"<input name='note' value='{current_note}' placeholder='메모 (선택)'>"
+            "<button type='submit'>저장</button>"
+            "</form>"
+            "</td>"
+            "</tr>"
+        )
+    if not row_chunks:
+        row_chunks.append("<tr><td colspan='6'>대상 없음</td></tr>")
+
+    info_lines = [
+        f"기간: {period_label}",
+        f"필터: vendor={profile_defaults['vendor'] or '-'}, product={profile_defaults['product'] or '-'}, keyword={profile_defaults['keyword'] or '-'}",
+        f"필터: impact={', '.join(profile_defaults['impact_type']) if profile_defaults['impact_type'] else '-'}, cpe_objects={len(profile_defaults['cpe_objects_catalog'])}",
+        f"검토상태: 미검토 {status_summary['pending']} / 검토완료 {status_summary['reviewed']} / 제외 {status_summary['ignored']}",
+    ]
+    notice_html = f"<p class='ok-msg'>{escape(notice_text)}</p>" if notice_text else ""
+    error_html = f"<p class='error-msg'>{escape(error_text)}</p>" if error_text else ""
+    menu_html = _build_menu_html("daily", user_profile=user_profile)
+
+    return f"""
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CVE Daily Review</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {{
+      --bg: #f7f4ee; --panel: #fffdf8; --ink: #1e2b31; --muted: #5e6c73; --line: #d7d5cc; --accent-2: #0f6f65;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; font-family: "Space Grotesk", "Pretendard", sans-serif; color: var(--ink); background: var(--bg); }}
+    .wrap {{ width: min(1360px, 94vw); margin: 20px auto 40px; }}
+    .top-menu {{ display:flex; gap:10px; margin-bottom:12px; }}
+    .menu-link {{ text-decoration:none; color:var(--ink); border:1px solid var(--line); background:#fff8ed; border-radius:999px; padding:8px 14px; font-size:13px; font-weight:700; }}
+    .menu-link.active {{ color:#fff; background:var(--accent-2); border-color:var(--accent-2); }}
+    .panel {{ border:1px solid var(--line); background:var(--panel); border-radius:16px; padding:14px; }}
+    .toolbar {{ display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end; margin-bottom:10px; }}
+    .toolbar label {{ font-size:12px; color:var(--muted); display:block; margin-bottom:4px; }}
+    .toolbar select,.toolbar input {{ border:1px solid var(--line); border-radius:8px; padding:8px 10px; font:inherit; background:#fff; }}
+    .toolbar button {{ border:1px solid var(--line); border-radius:8px; padding:8px 12px; font:inherit; font-weight:700; cursor:pointer; background:#fff; }}
+    .meta {{ margin: 8px 0 10px; font-size: 13px; color: var(--muted); }}
+    .ok-msg {{ color:#0c6d57; font-size:13px; font-weight:700; margin: 4px 0; }}
+    .error-msg {{ color:#ad3427; font-size:13px; font-weight:700; margin: 4px 0; }}
+    table {{ width:100%; border-collapse: collapse; }}
+    th, td {{ border-top:1px solid var(--line); padding:8px 10px; vertical-align:top; font-size:13px; }}
+    th {{ text-align:left; color:var(--muted); font-size:12px; text-transform:uppercase; }}
+    .id {{ white-space:nowrap; font-weight:700; }}
+    .review-form {{ display:grid; grid-template-columns: 120px 1fr auto; gap:6px; }}
+    .review-form select,.review-form input,.review-form button {{ border:1px solid var(--line); border-radius:7px; padding:6px 8px; font:inherit; }}
+    .review-form button {{ font-weight:700; background:#f0faf7; color:#1a5852; cursor:pointer; }}
+    .cvss-chip {{ display:inline-flex; min-width:84px; justify-content:center; border-radius:999px; padding:2px 8px; font-size:12px; border:1px solid transparent; }}
+    .cvss-critical {{ color:#9f1f1f; background:#fde8e8; border-color:#efb6b6; }}
+    .cvss-high {{ color:#9a4a00; background:#fff1e4; border-color:#f0c79c; }}
+    .cvss-medium {{ color:#7b6400; background:#fff8d8; border-color:#ead88a; }}
+    .cvss-low {{ color:#4b4f55; background:#eef0f3; border-color:#d3d8de; }}
+    .cvss-none {{ color:#8f98a3; background:#1b1f24; border-color:#2f3842; }}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    {menu_html}
+    <section class="panel">
+      <h1 style="margin:0 0 8px;font-size:24px;">일일 검토</h1>
+      <form method="get" class="toolbar">
+        <input type="hidden" name="user_profile" value="{escape(user_profile)}">
+        <div>
+          <label for="period_mode">기간 기준</label>
+          <select id="period_mode" name="period_mode">
+            <option value="previous_day" {'selected' if period_mode == 'previous_day' else ''}>전일 마감 기준</option>
+            <option value="last24h" {'selected' if period_mode == 'last24h' else ''}>현재 시점 최근 24h</option>
+          </select>
+        </div>
+        <div>
+          <label for="window_days">기간(일)</label>
+          <input id="window_days" name="window_days" type="number" min="1" max="30" value="{window_days}">
+        </div>
+        <div>
+          <label for="review_limit">조회 건수 상한</label>
+          <input id="review_limit" name="review_limit" type="number" min="1" max="1000" value="{review_limit}">
+        </div>
+        <button type="submit">새로고침</button>
+      </form>
+      {notice_html}
+      {error_html}
+      <p class="meta">대상 {total_count}건 (표시 {len(rows)}건) | {' | '.join(escape(line) for line in info_lines)}</p>
+      <table>
+        <thead>
+          <tr>
+            <th>CVE ID</th><th>CVSS</th><th>Type</th><th>Last Modified</th><th>Description</th><th>Review</th>
+          </tr>
+        </thead>
+        <tbody>
+          {''.join(row_chunks)}
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
 </html>
 """
 
