@@ -31,6 +31,7 @@ DEFAULT_PROFILE_SETTINGS: dict[str, object] = {
     "vendor": "",
     "product": "",
     "keyword": "",
+    "cpe_objects_catalog": [],
     "min_cvss": 0.0,
     "limit": 50,
     "impact_type": [],
@@ -58,6 +59,27 @@ def _sanitize_profile_settings(raw_settings: dict[str, object] | None) -> dict[s
     clean["vendor"] = str(raw_settings.get("vendor", "")).strip()
     clean["product"] = str(raw_settings.get("product", "")).strip()
     clean["keyword"] = str(raw_settings.get("keyword", "")).strip()
+    cpe_catalog_value = raw_settings.get("cpe_objects_catalog", [])
+    if isinstance(cpe_catalog_value, str):
+        cpe_catalog_candidates = [value.strip() for value in cpe_catalog_value.replace(",", "\n").splitlines()]
+    elif isinstance(cpe_catalog_value, list):
+        cpe_catalog_candidates = [str(value).strip() for value in cpe_catalog_value]
+    else:
+        cpe_catalog_candidates = []
+    clean_catalog: list[str] = []
+    seen_catalog: set[str] = set()
+    for value in cpe_catalog_candidates:
+        parts = [part.strip().lower() for part in value.split(":")]
+        if len(parts) < 2:
+            continue
+        if not parts[0] or not parts[1]:
+            continue
+        normalized = ":".join(parts[:3]) if len(parts) >= 3 and parts[2] else f"{parts[0]}:{parts[1]}"
+        if normalized in seen_catalog:
+            continue
+        seen_catalog.add(normalized)
+        clean_catalog.append(normalized)
+    clean["cpe_objects_catalog"] = clean_catalog
 
     try:
         clean["min_cvss"] = max(0.0, min(float(raw_settings.get("min_cvss", 0.0)), 10.0))
@@ -187,6 +209,7 @@ def _build_count_cache_key(
     last_modified_start_raw: str,
     last_modified_end_raw: str,
     cpe_missing_only: bool,
+    selected_cpe_objects: list[str] | None = None,
 ) -> str:
     return "|".join(
         [
@@ -198,6 +221,7 @@ def _build_count_cache_key(
             last_modified_start_raw,
             last_modified_end_raw,
             "1" if cpe_missing_only else "0",
+            ",".join(sorted(value.lower() for value in (selected_cpe_objects or []))),
         ]
     )
 
@@ -343,6 +367,7 @@ def export_xlsx() -> object:
     last_modified_end_raw = _compose_datetime_arg("last_modified_end")
     cpe_missing_only = request.args.get("cpe_missing_only") == "1"
     selected_impacts = [value.strip() for value in request.args.getlist("impact_type") if value.strip()]
+    selected_cpe_objects = [value.strip().lower() for value in request.args.getlist("cpe_object") if value.strip()]
     export_scope = (request.args.get("export_scope") or "page").strip().lower()
     if export_scope not in {"page", "all"}:
         export_scope = "page"
@@ -400,6 +425,7 @@ def export_xlsx() -> object:
         last_modified_start_raw,
         last_modified_end_raw,
         cpe_missing_only,
+        selected_cpe_objects,
     )
 
     rows: list[dict[str, object]] = []
@@ -419,6 +445,7 @@ def export_xlsx() -> object:
             last_modified_start=last_modified_start,
             last_modified_end=last_modified_end,
             cpe_missing_only=cpe_missing_only,
+            cpe_objects=selected_cpe_objects or None,
             include_total_count=False,
         )
     else:
@@ -439,6 +466,7 @@ def export_xlsx() -> object:
                 last_modified_start=last_modified_start,
                 last_modified_end=last_modified_end,
                 cpe_missing_only=cpe_missing_only,
+                cpe_objects=selected_cpe_objects or None,
                 include_total_count=(total_count is None and offset == 0),
             )
             if batch_total is not None:
@@ -470,6 +498,8 @@ def export_xlsx() -> object:
         filter_summary_parts.append(f"last_modified_end={last_modified_end_raw}")
     if cpe_missing_only:
         filter_summary_parts.append("cpe_missing_only=1")
+    if selected_cpe_objects:
+        filter_summary_parts.append(f"cpe_object={', '.join(selected_cpe_objects)}")
     filter_summary_parts.append(f"min_cvss={min_cvss}")
     filter_summary_parts.append(f"limit={limit}")
     filter_summary_parts.append(f"sort={sort_key}")
@@ -585,6 +615,7 @@ def settings_page() -> str | object:
             "vendor": (request.form.get("vendor") or "").strip(),
             "product": (request.form.get("product") or "").strip(),
             "keyword": (request.form.get("keyword") or "").strip(),
+            "cpe_objects_catalog": (request.form.get("cpe_objects_catalog") or "").strip(),
             "min_cvss": (request.form.get("min_cvss") or "").strip(),
             "limit": (request.form.get("limit") or "").strip(),
             "sort_key": (request.form.get("sort_key") or "").strip(),
@@ -819,12 +850,16 @@ def settings_page() -> str | object:
           <input id="vendor" name="vendor" value="{escape(str(profile_settings['vendor']))}" placeholder="e.g. ivanti">
         </div>
         <div>
-          <label for="product">기본 Product</label>
-          <input id="product" name="product" value="{escape(str(profile_settings['product']))}" placeholder="e.g. endpoint_manager_mobile">
+          <label for="product">기본 Product (쉼표로 OR)</label>
+          <input id="product" name="product" value="{escape(str(profile_settings['product']))}" placeholder="e.g. endpoint_manager_mobile, pulse_connect_secure">
         </div>
         <div>
-          <label for="keyword">기본 Keyword</label>
-          <input id="keyword" name="keyword" value="{escape(str(profile_settings['keyword']))}" placeholder="e.g. ssl">
+          <label for="keyword">기본 Keyword (쉼표로 OR)</label>
+          <input id="keyword" name="keyword" value="{escape(str(profile_settings['keyword']))}" placeholder="e.g. ssl, auth bypass, rce">
+        </div>
+        <div class="full">
+          <label for="cpe_objects_catalog">CPE 객체 목록 (한 줄 1개, vendor:product[:version])</label>
+          <textarea id="cpe_objects_catalog" name="cpe_objects_catalog" rows="4" style="width:100%;border:1px solid var(--line);border-radius:10px;padding:10px 12px;font:inherit;background:#fff;">{escape(chr(10).join(profile_settings['cpe_objects_catalog']))}</textarea>
         </div>
         <div>
           <label for="min_cvss">기본 Min CVSS</label>
@@ -924,6 +959,12 @@ def index() -> str:
         selected_impacts = [value.strip() for value in request.args.getlist("impact_type") if value.strip()]
     else:
         selected_impacts = list(profile_defaults["impact_type"])
+    cpe_objects_catalog = [str(value).strip().lower() for value in profile_defaults.get("cpe_objects_catalog", []) if str(value).strip()]
+    if "cpe_object_present" in request.args or "cpe_object" in request.args:
+        selected_cpe_objects = [value.strip().lower() for value in request.args.getlist("cpe_object") if value.strip()]
+    else:
+        selected_cpe_objects = []
+    selected_cpe_objects = [value for value in selected_cpe_objects if value in cpe_objects_catalog]
 
     sort_map = {
         "cvss_desc": ("cvss", "desc"),
@@ -987,6 +1028,7 @@ def index() -> str:
         last_modified_start_raw,
         last_modified_end_raw,
         cpe_missing_only,
+        selected_cpe_objects,
     )
     cached_total = _get_cached_count(count_cache_key)
     should_fetch_total_count = (page == 1) or (cached_total is None)
@@ -1028,6 +1070,7 @@ def index() -> str:
                 last_modified_start=last_modified_start,
                 last_modified_end=last_modified_end,
                 cpe_missing_only=cpe_missing_only,
+                cpe_objects=selected_cpe_objects or None,
                 include_total_count=should_fetch_total_count,
             )
             if total_count is None:
@@ -1093,6 +1136,8 @@ def index() -> str:
         base_query["cpe_missing_only_present"] = "1"
     if "last_modified_present" in request.args:
         base_query["last_modified_present"] = "1"
+    if "cpe_object_present" in request.args:
+        base_query["cpe_object_present"] = "1"
     if last_modified_start_raw:
         base_query["last_modified_start"] = last_modified_start_raw
     if last_modified_end_raw:
@@ -1101,6 +1146,8 @@ def index() -> str:
         base_query["impact_type"] = selected_impacts
     if cpe_missing_only:
         base_query["cpe_missing_only"] = "1"
+    if selected_cpe_objects:
+        base_query["cpe_object"] = selected_cpe_objects
 
     def build_sort_href(target: str) -> str:
         if target == "cvss":
@@ -1129,6 +1176,25 @@ def index() -> str:
     impact_selected_html = (
         "".join(f"<span class='impact-chip'>{escape(value)}</span>" for value in selected_impacts)
         if selected_impacts
+        else "<span class='impact-chip muted-chip'>No filter</span>"
+    )
+    cpe_object_options_html = "".join(
+        "<label class='impact-option'>"
+        f"<input type='checkbox' name='cpe_object' value='{escape(cpe_obj)}' {'checked' if cpe_obj in selected_cpe_objects else ''}>"
+        f"<span>{escape(cpe_obj)}</span>"
+        "</label>"
+        for cpe_obj in cpe_objects_catalog
+    )
+    cpe_object_summary = (
+        "No CPE object configured"
+        if not cpe_objects_catalog
+        else (
+            "All configured CPE objects" if not selected_cpe_objects else f"CPE Object ({len(selected_cpe_objects)} selected)"
+        )
+    )
+    cpe_object_selected_html = (
+        "".join(f"<span class='impact-chip'>{escape(value)}</span>" for value in selected_cpe_objects)
+        if selected_cpe_objects
         else "<span class='impact-chip muted-chip'>No filter</span>"
     )
     cpe_missing_checked = "checked" if cpe_missing_only else ""
@@ -1847,6 +1913,7 @@ def index() -> str:
         <input type="hidden" name="impact_type_present" value="1">
         <input type="hidden" name="cpe_missing_only_present" value="1">
         <input type="hidden" name="last_modified_present" value="1">
+        <input type="hidden" name="cpe_object_present" value="1">
         <div class="field-lastmod-start">
           <label for="last_modified_start_date">Last Modified Start</label>
           <div class="datetime-parts">
@@ -1889,16 +1956,26 @@ def index() -> str:
           <button type="submit">Search CVEs</button>
         </div>
         <div class="field-keyword">
-          <label for="keyword">Keyword (description/vendor/product)</label>
-          <input id="keyword" name="keyword" value="{escape(keyword)}" placeholder="e.g. ssl, ivanti, endpoint">
+          <label for="keyword">Keyword (comma = OR; description/vendor/product)</label>
+          <input id="keyword" name="keyword" value="{escape(keyword)}" placeholder="e.g. ssl, auth bypass, endpoint">
         </div>
         <div class="field-vendor">
           <label for="vendor">Vendor</label>
           <input id="vendor" name="vendor" value="{escape(vendor)}" placeholder="e.g. ivanti">
         </div>
         <div class="field-product">
-          <label for="product">Product</label>
-          <input id="product" name="product" value="{escape(product)}" placeholder="e.g. endpoint_manager_mobile">
+          <label for="product">Product (comma = OR)</label>
+          <input id="product" name="product" value="{escape(product)}" placeholder="e.g. endpoint_manager_mobile, pulse_connect_secure">
+        </div>
+        <div class="field-impact">
+          <label for="cpe_object">CPE Object (on/off)</label>
+          <details class="impact-details">
+            <summary>{escape(cpe_object_summary)}</summary>
+            <div class="impact-list">
+              {cpe_object_options_html}
+            </div>
+          </details>
+          <div class="impact-selected">{cpe_object_selected_html}</div>
         </div>
         <input type="hidden" name="sort_key" value="{escape(sort_key)}">
         <div class="actions-bar">
@@ -2085,6 +2162,12 @@ def index() -> str:
           }}
           if (!formData.has("cpe_missing_only")) {{
             params.delete("cpe_missing_only");
+          }}
+          if (!formData.has("impact_type")) {{
+            params.delete("impact_type");
+          }}
+          if (!formData.has("cpe_object")) {{
+            params.delete("cpe_object");
           }}
         }}
         params.set("export_scope", exportScope);

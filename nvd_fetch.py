@@ -8,6 +8,38 @@ import psycopg2
 from settings import Settings, load_settings
 
 
+def _split_or_terms(raw_value: str | None) -> list[str]:
+    if not raw_value:
+        return []
+    parts = [value.strip() for value in raw_value.replace("\n", ",").split(",")]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in parts:
+        if not value:
+            continue
+        lowered = value.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(value)
+    return deduped
+
+
+def _parse_cpe_object(raw_value: str) -> tuple[str, str, str | None] | None:
+    value = raw_value.strip().lower()
+    if not value:
+        return None
+    parts = [part.strip() for part in value.split(":")]
+    if len(parts) < 2:
+        return None
+    vendor = parts[0]
+    product = parts[1]
+    if not vendor or not product:
+        return None
+    version = parts[2] if len(parts) >= 3 and parts[2] else None
+    return (vendor, product, version)
+
+
 def fetch_incremental_checkpoint(settings: Settings) -> datetime | None:
     conn = psycopg2.connect(
         host=settings.db_host,
@@ -41,6 +73,7 @@ def fetch_cves_from_db(
     last_modified_start: Any | None = None,
     last_modified_end: Any | None = None,
     cpe_missing_only: bool = False,
+    cpe_objects: list[str] | None = None,
     include_total_count: bool = True,
 ) -> tuple[list[dict[str, Any]], int | None]:
     where_clauses = [
@@ -48,7 +81,11 @@ def fetch_cves_from_db(
     ]
     params: list[Any] = [min_cvss]
 
-    if product and vendor:
+    product_terms = _split_or_terms(product)
+    keyword_terms = _split_or_terms(keyword)
+
+    if product_terms and vendor:
+        product_or_sql = " OR ".join(["f.product ILIKE %s"] * len(product_terms))
         where_clauses.append(
             """
             EXISTS (
@@ -56,14 +93,16 @@ def fetch_cves_from_db(
                 FROM cve_cpe AS f
                 WHERE f.cve_id = c.id
                   AND f.vulnerable = TRUE
-                  AND f.product ILIKE %s
+                  AND ({product_or_sql})
                   AND f.vendor ILIKE %s
             )
             """
+            .replace("{product_or_sql}", product_or_sql)
         )
-        params.append(f"%{product}%")
+        params.extend(f"%{term}%" for term in product_terms)
         params.append(f"%{vendor}%")
-    elif product:
+    elif product_terms:
+        product_or_sql = " OR ".join(["f.product ILIKE %s"] * len(product_terms))
         where_clauses.append(
             """
             EXISTS (
@@ -71,11 +110,12 @@ def fetch_cves_from_db(
                 FROM cve_cpe AS f
                 WHERE f.cve_id = c.id
                   AND f.vulnerable = TRUE
-                  AND f.product ILIKE %s
+                  AND ({product_or_sql})
             )
             """
+            .replace("{product_or_sql}", product_or_sql)
         )
-        params.append(f"%{product}%")
+        params.extend(f"%{term}%" for term in product_terms)
     elif vendor:
         where_clauses.append(
             """
@@ -89,14 +129,17 @@ def fetch_cves_from_db(
             """
         )
         params.append(f"%{vendor}%")
-    if keyword:
+    if keyword_terms:
+        desc_or_sql = " OR ".join(["d ->> 'value' ILIKE %s"] * len(keyword_terms))
+        cpe_vendor_or_sql = " OR ".join(["k.vendor ILIKE %s"] * len(keyword_terms))
+        cpe_product_or_sql = " OR ".join(["k.product ILIKE %s"] * len(keyword_terms))
         where_clauses.append(
             """
             (
                 EXISTS (
                     SELECT 1
                     FROM jsonb_array_elements(COALESCE(c.raw #> '{cve,descriptions}', '[]'::jsonb)) AS d
-                    WHERE d ->> 'value' ILIKE %s
+                    WHERE ({desc_or_sql})
                 )
                 OR EXISTS (
                     SELECT 1
@@ -104,16 +147,19 @@ def fetch_cves_from_db(
                     WHERE k.cve_id = c.id
                       AND k.vulnerable = TRUE
                       AND (
-                        k.vendor ILIKE %s
-                        OR k.product ILIKE %s
+                        ({cpe_vendor_or_sql})
+                        OR ({cpe_product_or_sql})
                       )
                 )
             )
             """
+            .replace("{desc_or_sql}", desc_or_sql)
+            .replace("{cpe_vendor_or_sql}", cpe_vendor_or_sql)
+            .replace("{cpe_product_or_sql}", cpe_product_or_sql)
         )
-        params.append(f"%{keyword}%")
-        params.append(f"%{keyword}%")
-        params.append(f"%{keyword}%")
+        params.extend(f"%{term}%" for term in keyword_terms)
+        params.extend(f"%{term}%" for term in keyword_terms)
+        params.extend(f"%{term}%" for term in keyword_terms)
     if impact_types:
         where_clauses.append("c.impact_type = ANY(%s)")
         params.append(impact_types)
@@ -134,6 +180,38 @@ def fetch_cves_from_db(
             )
             """
         )
+    if cpe_objects:
+        normalized_cpe_objects: list[tuple[str, str, str | None]] = []
+        seen_cpe_keys: set[tuple[str, str, str | None]] = set()
+        for raw_value in cpe_objects:
+            parsed = _parse_cpe_object(raw_value)
+            if not parsed or parsed in seen_cpe_keys:
+                continue
+            seen_cpe_keys.add(parsed)
+            normalized_cpe_objects.append(parsed)
+        if normalized_cpe_objects:
+            cpe_match_parts: list[str] = []
+            for vendor_value, product_value, version_value in normalized_cpe_objects:
+                if version_value:
+                    cpe_match_parts.append(
+                        "(LOWER(cf.vendor) = %s AND LOWER(cf.product) = %s AND LOWER(COALESCE(cf.version, '')) = %s)"
+                    )
+                    params.extend([vendor_value, product_value, version_value])
+                else:
+                    cpe_match_parts.append("(LOWER(cf.vendor) = %s AND LOWER(cf.product) = %s)")
+                    params.extend([vendor_value, product_value])
+            where_clauses.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM cve_cpe AS cf
+                    WHERE cf.cve_id = c.id
+                      AND cf.vulnerable = TRUE
+                      AND ({cpe_match_sql})
+                )
+                """
+                .replace("{cpe_match_sql}", " OR ".join(cpe_match_parts))
+            )
 
     where_sql = " AND ".join(where_clauses)
     sort_key = (sort_by or "cvss").lower()

@@ -99,7 +99,9 @@ python3 web_app.py --host 0.0.0.0 --port 8888
 
 지원 필터:
 - `Last Modified Start/End` (날짜+시간 범위)
-- `vendor`, `product`, `min_cvss`, `Impact Type`(다중 선택), `limit`
+- `vendor`, `product`(쉼표 구분 OR), `keyword`(쉼표 구분 OR)
+- `min_cvss`, `Impact Type`(다중 선택), `limit`
+- `CPE Object`(설정 페이지에 등록한 `vendor:product[:version]` 목록을 on/off로 선택)
 - `CPE missing only` (vulnerable CPE가 없는 CVE만)
 
 표시/동작:
